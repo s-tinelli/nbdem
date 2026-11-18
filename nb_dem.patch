@@ -1,0 +1,2872 @@
+diff --git a/file_lists/pybind_files b/file_lists/pybind_files
+index a0cb48e..a91f78f 100644
+--- a/file_lists/pybind_files
++++ b/file_lists/pybind_files
+@@ -27,3 +27,4 @@ src/stim/stabilizers/pauli_string.pybind.cc
+ src/stim/stabilizers/pauli_string_iter.pybind.cc
+ src/stim/stabilizers/tableau.pybind.cc
+ src/stim/stabilizers/tableau_iter.pybind.cc
++src/stim/util_top/circuit_to_nb_dem.pybind.cc
+diff --git a/file_lists/source_files_no_main b/file_lists/source_files_no_main
+index c074a66..f745bc5 100644
+--- a/file_lists/source_files_no_main
++++ b/file_lists/source_files_no_main
+@@ -100,3 +100,5 @@ src/stim/util_top/missing_detectors.cc
+ src/stim/util_top/reference_sample_tree.cc
+ src/stim/util_top/simplified_circuit.cc
+ src/stim/util_top/transform_without_feedback.cc
++src/stim/util_top/circuit_to_nb_dem.cc
++src/stim/cmd/command_analyze_errors_nb.cc
+diff --git a/file_lists/test_files b/file_lists/test_files
+index e669bc2..98ebf5a 100644
+--- a/file_lists/test_files
++++ b/file_lists/test_files
+@@ -101,3 +101,4 @@ src/stim/util_top/stabilizers_to_tableau.test.cc
+ src/stim/util_top/stabilizers_vs_amplitudes.test.cc
+ src/stim/util_top/transform_without_feedback.test.cc
+ src/stim_included_twice.test.cc
++src/stim/util_top/circuit_to_nb_dem.test.cc
+diff --git a/src/stim/circuit/circuit.pybind.cc b/src/stim/circuit/circuit.pybind.cc
+index d073173..843d8e8 100644
+--- a/src/stim/circuit/circuit.pybind.cc
++++ b/src/stim/circuit/circuit.pybind.cc
+@@ -33,6 +33,7 @@
+ #include "stim/py/numpy.pybind.h"
+ #include "stim/search/search.h"
+ #include "stim/simulators/error_analyzer.h"
++#include "stim/util_top/circuit_to_nb_dem.h"
+ #include "stim/simulators/error_matcher.h"
+ #include "stim/simulators/measurements_to_detection_events.pybind.h"
+ #include "stim/simulators/tableau_simulator.h"
+@@ -1804,6 +1805,65 @@ void stim_pybind::pybind_circuit_methods(pybind11::module &, pybind11::class_<Ci
+         )DOC")
+             .data());
+ 
++        c.def(
++            "nonbinary_detector_error_model",
++            [](const Circuit &self, const std::string &merge, bool allow_gauge_detectors) -> NonbinaryDem {
++                NbDemOptions options;
++                if (merge == "parts") {
++                    options.merge = NbDemMergeMode::PARTS;
++                } else if (merge == "columns") {
++                    options.merge = NbDemMergeMode::COLUMNS;
++                } else if (merge == "none") {
++                    options.merge = NbDemMergeMode::NONE;
++                } else {
++                    throw std::invalid_argument(
++                        "merge must be 'parts', 'columns' or 'none', not '" + merge + "'.");
++                }
++                options.allow_gauge_detectors = allow_gauge_detectors;
++                return circuit_to_nonbinary_dem(self, options);
++            },
++            pybind11::kw_only(),
++            pybind11::arg("merge") = "parts",
++            pybind11::arg("allow_gauge_detectors") = false,
++            clean_doc_string(R"DOC(
++                Returns a non-binary detector error model describing the error
++                processes in the circuit.
++
++                Each fault location is a single variable over F_2^r (r = 1, 2
++                or 4) with its exact prior, instead of being split into
++                independent binary mechanisms. For circuits whose channels
++                factorize (e.g. depolarizing and bit flip channels) the model is
++                statistically identical to the output of
++                `circuit.detector_error_model()`.
++
++                Args:
++                    merge: How columns are merged.
++                        'parts' (default): full split-merge-regroup construction.
++                        'columns': only merge columns with equal span.
++                        'none': one raw column per noise channel application.
++                    allow_gauge_detectors: When true, non-deterministic
++                        detectors are replaced by 50/50 error mechanisms
++                        instead of causing failure.
++
++                Returns:
++                    The non-binary stim.NonbinaryDem.
++
++                Examples:
++                    >>> import stim
++                    >>> circuit = stim.Circuit('''
++                    ...     R 0 1
++                    ...     DEPOLARIZE2(0.01) 0 1
++                    ...     M 0 1
++                    ...     DETECTOR rec[-2]
++                    ...     DETECTOR rec[-1]
++                    ... ''')
++                    >>> model = circuit.nonbinary_detector_error_model()
++                    >>> len(model)
++                    1
++            )DOC")
++                .data());
++
++
+     c.def(
+         "approx_equals",
+         [](const Circuit &self, const pybind11::object &obj, double atol) -> bool {
+diff --git a/src/stim/cmd/command_analyze_errors_nb.cc b/src/stim/cmd/command_analyze_errors_nb.cc
+new file mode 100644
+index 0000000..76e382b
+--- /dev/null
++++ b/src/stim/cmd/command_analyze_errors_nb.cc
+@@ -0,0 +1,146 @@
++/*
++ * Copyright 2026 DLR.
++ *
++ * This file is part of a patch to Stim implementing non-binary detector error
++ * models, following "Non-Binary Detector Error Models".
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "stim/cmd/command_analyze_errors_nb.h"
++
++#include "stim/cmd/command_help.h"
++#include "stim/util_bot/arg_parse.h"
++#include "stim/util_top/circuit_to_nb_dem.h"
++
++using namespace stim;
++
++int stim::command_analyze_errors_nb(int argc, const char **argv) {
++    check_for_unknown_arguments(
++        {
++            "--allow_gauge_detectors",
++            "--in",
++            "--merge",
++            "--format",
++            "--out",
++        },
++        {"--analyze_errors_nb"},
++        "analyze_errors_nb",
++        argc,
++        argv);
++    bool allow_gauge_detectors = find_bool_argument("--allow_gauge_detectors", argc, argv);
++    const char *merge_arg = find_argument("--merge", argc, argv);
++    NbDemOptions options;
++    if (merge_arg == nullptr || *merge_arg == '\0' || strcmp(merge_arg, "parts") == 0) {
++        options.merge = NbDemMergeMode::PARTS;
++    } else if (strcmp(merge_arg, "columns") == 0) {
++        options.merge = NbDemMergeMode::COLUMNS;
++    } else if (strcmp(merge_arg, "none") == 0) {
++        options.merge = NbDemMergeMode::NONE;
++    } else {
++        std::stringstream msg;
++        msg << " unrecognized value '" << merge_arg << "'";
++        throw std::invalid_argument(msg.str());
++    }
++    options.allow_gauge_detectors = allow_gauge_detectors;
++    bool json = false;
++    const char *format_arg = find_argument("--format", argc, argv);
++    if (format_arg == nullptr || *format_arg == '\0' || strcmp(format_arg, "text") == 0) {
++        json = false;
++    } else if (strcmp(format_arg, "json") == 0) {
++        json = true;
++    } else {
++        std::stringstream msg;
++        msg << " unrecognized value '" << format_arg << "'";
++        throw std::invalid_argument(msg.str());
++    }
++
++    FILE *in = find_open_file_argument("--in", stdin, "rb", argc, argv);
++    auto out_stream = find_output_stream_argument("--out", true, argc, argv);
++    std::ostream &out = out_stream.stream();
++    auto circuit = Circuit::from_file(in);
++    if (in != stdin) {
++        fclose(in);
++    }
++    auto model = circuit_to_nonbinary_dem(circuit, options);
++    out << (json ? model.to_json() : model.str()) << "\n";
++    return EXIT_SUCCESS;
++}
++
++SubCommandHelp stim::command_analyze_errors_nb_help() {
++    SubCommandHelp result;
++    result.subcommand_name = "analyze_errors_nb";
++    result.description = "Converts a circuit into a non-binary detector error model.";
++
++    result.examples.push_back(clean_doc_string(R"PARAGRAPH(
++            >>> cat example_circuit.stim
++            R 0 1
++            H 0
++            CX 0 1
++            DEPOLARIZE1(0.03) 0
++            MPP X0*X1
++            MPP Z0*Z1
++            DETECTOR rec[-2]
++            DETECTOR rec[-1]
++
++            >>> stim analyze_errors_nb --in example_circuit.stim
++            nb_detector_error_model num_detectors=2 num_observables=0
++            merge=parts num_columns=1
++            column[0] rank=2 factorized=yes
++              prior 0.97 0.01 0.01 0.01
++              det_edge D0 X
++              det_edge D1 Z
++              generator X@0
++              generator Z@0
++              origin DEPOLARIZE1(0.03) 0
++              part 0.0101020514433644 D0
++              part 0.0101020514433644 D1
++              part 0.0101020514433644 D0 D1
++        )PARAGRAPH"));
++
++    result.flags.push_back(
++        {"--merge",
++         "str",
++         "parts",
++         {"parts", "columns", "none"},
++         "How columns are merged:\n"
++         "    parts: full split-merge-regroup (default; exact, most compact)\n"
++         "    columns: only merge columns with equal span\n"
++         "    none: one raw column per noise channel application"});
++    result.flags.push_back(
++        {"--format",
++         "str",
++         "text",
++         {"text", "json"},
++         "Output format of the non-binary detector error model."});
++    result.flags.push_back(
++        {"--in",
++         "",
++         "",
++         {},
++         "Uses this circuit file, instead of stdin."});
++    result.flags.push_back(
++        {"--out",
++         "",
++         "",
++         {},
++         "Writes the model to this file, instead of stdout."});
++    result.flags.push_back(
++        {"--allow_gauge_detectors",
++         "",
++         "",
++         {},
++         "Allows non-deterministic detectors to be replaced by 50/50 error mechanisms instead of failing."});
++
++    return result;
++}
+diff --git a/src/stim/cmd/command_analyze_errors_nb.h b/src/stim/cmd/command_analyze_errors_nb.h
+new file mode 100644
+index 0000000..670c925
+--- /dev/null
++++ b/src/stim/cmd/command_analyze_errors_nb.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026 DLR.
++ *
++ * This file is part of a patch to Stim implementing non-binary detector error
++ * models, following "Non-Binary Detector Error Models".
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _STIM_CMD_COMMAND_ANALYZE_ERRORS_NB_H
++#define _STIM_CMD_COMMAND_ANALYZE_ERRORS_NB_H
++
++#include "stim/util_bot/arg_parse.h"
++
++namespace stim {
++
++int command_analyze_errors_nb(int argc, const char **argv);
++SubCommandHelp command_analyze_errors_nb_help();
++
++}  // namespace stim
++
++#endif
+diff --git a/src/stim/cmd/command_help.cc b/src/stim/cmd/command_help.cc
+index d0652a0..5a03c60 100644
+--- a/src/stim/cmd/command_help.cc
++++ b/src/stim/cmd/command_help.cc
+@@ -22,6 +22,7 @@
+ 
+ #include "stim/circuit/circuit.h"
+ #include "stim/cmd/command_analyze_errors.h"
++#include "stim/cmd/command_analyze_errors_nb.h"
+ #include "stim/cmd/command_convert.h"
+ #include "stim/cmd/command_detect.h"
+ #include "stim/cmd/command_diagram.h"
+@@ -97,6 +98,7 @@ std::vector<SubCommandHelp> make_sub_command_help() {
+     help_help.description = "Prints helpful information about using stim.";
+     auto result = std::vector<SubCommandHelp>{
+         command_analyze_errors_help(),
++        command_analyze_errors_nb_help(),
+         command_convert_help(),
+         command_detect_help(),
+         command_diagram_help(),
+diff --git a/src/stim/main_namespaced.cc b/src/stim/main_namespaced.cc
+index ba5931e..0db3ad9 100644
+--- a/src/stim/main_namespaced.cc
++++ b/src/stim/main_namespaced.cc
+@@ -17,6 +17,7 @@
+ #include <cstring>
+ 
+ #include "stim/cmd/command_analyze_errors.h"
++#include "stim/cmd/command_analyze_errors_nb.h"
+ #include "stim/cmd/command_convert.h"
+ #include "stim/cmd/command_detect.h"
+ #include "stim/cmd/command_diagram.h"
+@@ -54,6 +55,7 @@ int stim::main(int argc, const char **argv) {
+         bool mode_diagram = is_mode("diagram");
+         bool mode_detect = is_mode("--detect");
+         bool mode_analyze_errors = is_mode("--analyze_errors");
++        bool mode_analyze_errors_nb = is_mode("--analyze_errors_nb");
+         bool mode_gen = is_mode("--gen");
+         bool mode_m2d = is_mode("--m2d");
+         bool mode_explain_errors = is_mode("--explain_errors");
+@@ -64,7 +66,8 @@ int stim::main(int argc, const char **argv) {
+         }
+         bool mode_convert = is_mode("--convert");
+         int modes_picked =
+-            (mode_repl + mode_sample + mode_sample_dem + mode_detect + mode_analyze_errors + mode_gen + mode_m2d +
++            (mode_repl + mode_sample + mode_sample_dem + mode_detect + mode_analyze_errors +
++             mode_analyze_errors_nb + mode_gen + mode_m2d +
+              mode_explain_errors + mode_diagram + mode_convert);
+         if (modes_picked != 1) {
+             std::cerr << "\033[31m";
+@@ -93,6 +96,9 @@ int stim::main(int argc, const char **argv) {
+         if (mode_analyze_errors) {
+             return command_analyze_errors(argc, argv);
+         }
++        if (mode_analyze_errors_nb) {
++            return command_analyze_errors_nb(argc, argv);
++        }
+         if (mode_m2d) {
+             return command_m2d(argc, argv);
+         }
+diff --git a/src/stim/py/stim.pybind.cc b/src/stim/py/stim.pybind.cc
+index 6fec31a..096820a 100644
+--- a/src/stim/py/stim.pybind.cc
++++ b/src/stim/py/stim.pybind.cc
+@@ -22,6 +22,7 @@
+ #include "stim/cmd/command_diagram.pybind.h"
+ #include "stim/dem/dem_instruction.pybind.h"
+ #include "stim/dem/detector_error_model.pybind.h"
++#include "stim/util_top/circuit_to_nb_dem.pybind.h"
+ #include "stim/dem/detector_error_model_repeat_block.pybind.h"
+ #include "stim/dem/detector_error_model_target.pybind.h"
+ #include "stim/gates/gates.pybind.h"
+@@ -625,6 +626,7 @@ PYBIND11_MODULE(STIM_PYBIND11_MODULE_NAME, m) {
+     pybind_read_write(m);
+ 
+     // method definitions
++    pybind_nonbinary_dem_method_defs(m);
+     pybind_circuit_instruction_methods(m, c_circuit_instruction);
+     pybind_circuit_gate_target_methods(m, c_circuit_gate_target);
+     pybind_gate_data_methods(m, c_gate_data);
+diff --git a/src/stim/util_top/circuit_to_nb_dem.cc b/src/stim/util_top/circuit_to_nb_dem.cc
+new file mode 100644
+index 0000000..08d47d2
+--- /dev/null
++++ b/src/stim/util_top/circuit_to_nb_dem.cc
+@@ -0,0 +1,1484 @@
++/*
++ * Non-binary detector error models: construction from a circuit.
++ *
++ * See circuit_to_nb_dem.h for the API documentation, and
++ * "Non-Binary Detector Error Models" for the algorithm (split, merge and
++ * regroup).
++ *
++ * Copyright 2026 DLR.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "stim/util_top/circuit_to_nb_dem.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#include "stim/simulators/error_analyzer.h"
++#include "stim/stabilizers/pauli_string.h"
++
++using namespace stim;
++
++namespace {
++
++constexpr size_t MAX_RANK = 16;
++
++/// A symptom: a bitset over detectors (bits [0, num_detectors)) and
++/// observables (bits [num_detectors, num_detectors + num_observables)).
++struct Symptom {
++    std::vector<uint64_t> words;
++    size_t num_bits;
++
++    explicit Symptom(size_t bits) : words((bits + 63) / 64, 0), num_bits(bits) {}
++
++    inline bool get(size_t bit) const {
++        return (words[bit >> 6] >> (bit & 63)) & 1;
++    }
++
++    inline void set(size_t bit) {
++        words[bit >> 6] |= 1ULL << (bit & 63);
++    }
++
++    inline bool is_zero() const {
++        for (uint64_t w : words) {
++            if (w) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    inline void xor_with(const Symptom &other) {
++        for (size_t k = 0; k < words.size(); k++) {
++            words[k] ^= other.words[k];
++        }
++    }
++
++    inline bool operator==(const Symptom &other) const {
++        return words == other.words;
++    }
++
++    inline bool operator<(const Symptom &other) const {
++        return words < other.words;
++    }
++};
++
++struct NbDemContext {
++    size_t num_detectors;
++    size_t num_observables;
++    inline size_t num_bits() const {
++        return num_detectors + num_observables;
++    }
++};
++
++/// Converts a range of sorted DemTargets (from the error analyzer's tracker)
++/// into a Symptom. Targets hold absolute detector/observable ids.
++Symptom symptom_from_targets(const NbDemContext &ctx, SpanRef<const DemTarget> targets) {
++    Symptom result(ctx.num_bits());
++    for (const auto &t : targets) {
++        if (t.is_relative_detector_id()) {
++            if (t.raw_id() >= ctx.num_detectors) {
++                throw std::invalid_argument("Detector id out of range in error symptom.");
++            }
++            result.set(t.raw_id());
++        } else if (t.is_observable_id()) {
++            size_t obs = t.raw_id();
++            if (obs >= ctx.num_observables) {
++                throw std::invalid_argument("Observable id out of range in error symptom.");
++            }
++            result.set(ctx.num_detectors + obs);
++        } else {
++            throw std::invalid_argument("Unexpected separator target in error symptom.");
++        }
++    }
++    return result;
++}
++
++/// Splits a symptom into sorted detector and observable index lists.
++void symptom_to_lists(
++    const NbDemContext &ctx, const Symptom &s, std::vector<uint32_t> &dets, std::vector<uint32_t> &obs) {
++    dets.clear();
++    obs.clear();
++    for (size_t b = 0; b < ctx.num_detectors; b++) {
++        if (s.get(b)) {
++            dets.push_back((uint32_t)b);
++        }
++    }
++    for (size_t b = 0; b < ctx.num_observables; b++) {
++        if (s.get(ctx.num_detectors + b)) {
++            obs.push_back((uint32_t)b);
++        }
++    }
++}
++
++/// One raw column: one application of a noise channel, before any merging.
++struct RawColumn {
++    /// Location order key: (forward instruction index, sub index).
++    std::pair<size_t, size_t> order;
++    std::string description;
++    std::string tag;
++    std::vector<Symptom> generators;
++    /// (raw coordinate bit mask over generators, probability), positive entries only.
++    std::vector<std::pair<uint64_t, double>> prior;
++    std::vector<std::string> generator_labels;
++};
++
++/// A matrix in reduced row echelon form over symptoms as row vectors.
++/// Canonical form of a subspace; used for span identity and coordinates.
++struct RrefBasis {
++    std::vector<Symptom> rows;
++    std::vector<size_t> pivot_cols;
++
++    inline size_t rank() const {
++        return rows.size();
++    }
++
++    inline bool contains(const Symptom &v) const {
++        return solve_coords(v).second;
++    }
++
++    /// Reduces v against the basis. Returns (coordinates over rows, in_span).
++    std::pair<uint64_t, bool> solve_coords(Symptom v) const {
++        uint64_t coords = 0;
++        for (size_t i = 0; i < rows.size(); i++) {
++            if (v.get(pivot_cols[i])) {
++                v.xor_with(rows[i]);
++                coords |= 1ULL << i;
++            }
++        }
++        return {coords, v.is_zero()};
++    }
++};
++
++/// Canonical reduced row echelon basis of the span of the given vectors.
++/// Zero vectors are ignored.
++RrefBasis canonical_rref(const std::vector<Symptom> &vectors, size_t num_bits) {
++    std::vector<std::vector<uint64_t>> rows;
++    for (const auto &v : vectors) {
++        if (!v.is_zero()) {
++            rows.push_back(v.words);
++        }
++    }
++    std::vector<size_t> pivot_col_of_row;
++    for (size_t col = 0; col < num_bits; col++) {
++        if (pivot_col_of_row.size() == rows.size()) {
++            break;
++        }
++        size_t w = col >> 6;
++        uint64_t bit = 1ULL << (col & 63);
++        size_t pivot = SIZE_MAX;
++        for (size_t r = pivot_col_of_row.size(); r < rows.size(); r++) {
++            if (rows[r][w] & bit) {
++                pivot = r;
++                break;
++            }
++        }
++        if (pivot == SIZE_MAX) {
++            continue;
++        }
++        std::swap(rows[pivot_col_of_row.size()], rows[pivot]);
++        size_t pr = pivot_col_of_row.size();
++        const std::vector<uint64_t> &prow = rows[pr];
++        for (size_t r = 0; r < rows.size(); r++) {
++            if (r != pr && (rows[r][w] & bit)) {
++                for (size_t k = 0; k < prow.size(); k++) {
++                    rows[r][k] ^= prow[k];
++                }
++            }
++        }
++        pivot_col_of_row.push_back(col);
++    }
++    RrefBasis basis;
++    for (size_t r = 0; r < pivot_col_of_row.size(); r++) {
++        Symptom s(num_bits);
++        s.words = rows[r];
++        basis.rows.push_back(std::move(s));
++        basis.pivot_cols.push_back(pivot_col_of_row[r]);
++    }
++    return basis;
++}
++
++/// An (arbitrary, ordered) basis with a solver for coordinates, built by
++/// Gaussian elimination on rows augmented with unit coefficient masks.
++struct AugmentedBasis {
++    std::vector<Symptom> rows;
++    std::vector<uint64_t> coeffs;  // coefficient masks over the original basis order
++    std::vector<size_t> pivot_cols;
++
++    /// Solves v = xor of basis[i] for i in the returned mask.
++    std::pair<uint64_t, bool> solve(const Symptom &v) const {
++        Symptom cur = v;
++        uint64_t x = 0;
++        for (size_t i = 0; i < rows.size(); i++) {
++            if (cur.get(pivot_cols[i])) {
++                cur.xor_with(rows[i]);
++                x ^= coeffs[i];
++            }
++        }
++        return {x, cur.is_zero()};
++    }
++};
++
++AugmentedBasis make_augmented_basis(const std::vector<Symptom> &basis, size_t num_bits) {
++    std::vector<std::vector<uint64_t>> rows;
++    std::vector<uint64_t> coeffs;
++    for (size_t i = 0; i < basis.size(); i++) {
++        if (!basis[i].is_zero()) {
++            rows.push_back(basis[i].words);
++            coeffs.push_back(1ULL << i);
++        }
++    }
++    std::vector<size_t> pivot_col_of_row;
++    for (size_t col = 0; col < num_bits; col++) {
++        if (pivot_col_of_row.size() == rows.size()) {
++            break;
++        }
++        size_t w = col >> 6;
++        uint64_t bit = 1ULL << (col & 63);
++        size_t pivot = SIZE_MAX;
++        for (size_t r = pivot_col_of_row.size(); r < rows.size(); r++) {
++            if (rows[r][w] & bit) {
++                pivot = r;
++                break;
++            }
++        }
++        if (pivot == SIZE_MAX) {
++            continue;
++        }
++        std::swap(rows[pivot_col_of_row.size()], rows[pivot]);
++        std::swap(coeffs[pivot_col_of_row.size()], coeffs[pivot]);
++        size_t pr = pivot_col_of_row.size();
++        const std::vector<uint64_t> &prow = rows[pr];
++        for (size_t r = 0; r < rows.size(); r++) {
++            if (r != pr && (rows[r][w] & bit)) {
++                for (size_t k = 0; k < prow.size(); k++) {
++                    rows[r][k] ^= prow[k];
++                }
++                coeffs[r] ^= coeffs[pr];
++            }
++        }
++        pivot_col_of_row.push_back(col);
++    }
++    AugmentedBasis out;
++    for (size_t r = 0; r < pivot_col_of_row.size(); r++) {
++        Symptom s(num_bits);
++        s.words = rows[r];
++        out.rows.push_back(std::move(s));
++        out.coeffs.push_back(coeffs[r]);
++        out.pivot_cols.push_back(pivot_col_of_row[r]);
++    }
++    return out;
++}
++
++/// A column during the construction, after reduction (and span merging).
++struct WorkColumn {
++    std::pair<size_t, size_t> order;
++    std::vector<std::string> origins;
++    std::string tag;
++    std::vector<Symptom> native_generators;
++    std::vector<std::string> native_labels;
++    size_t rank = 0;
++    std::vector<double> prior;  // over the canonical rref basis coordinates
++    RrefBasis basis;            // canonical basis of the column's span
++    /// Symptom of each coordinate value (size 2^rank).
++    std::vector<Symptom> symptom_of_coord;
++    bool factorized = true;
++};
++
++double xor_merge_probs(double a, double b) {
++    return a * (1 - b) + (1 - a) * b;
++}
++
++/// XOR-convolution of two priors over F_2^rank (in a common basis).
++std::vector<double> xor_convolve(const std::vector<double> &a, const std::vector<double> &b) {
++    std::vector<double> out(a.size(), 0.0);
++    for (size_t u1 = 0; u1 < a.size(); u1++) {
++        if (a[u1] == 0) {
++            continue;
++        }
++        for (size_t u2 = 0; u2 < b.size(); u2++) {
++            if (b[u2] != 0) {
++                out[u1 ^ u2] += a[u1] * b[u2];
++            }
++        }
++    }
++    return out;
++}
++
++/// Reduces a raw column to the span of its support. Returns false if the
++/// column flips no detector and no observable (it must be dropped).
++bool reduce_raw_column(const NbDemContext &ctx, const RawColumn &raw, WorkColumn &out) {
++    // Merge support points with equal symptoms. Unlisted probability mass is
++    // the identity outcome, which flips nothing (zero symptom).
++    std::map<std::vector<uint64_t>, double> by_symptom;
++    double listed_total = 0;
++    for (const auto &[coords, p] : raw.prior) {
++        if (p <= 0) {
++            continue;
++        }
++        Symptom s(ctx.num_bits());
++        for (size_t g = 0; g < raw.generators.size(); g++) {
++            if ((coords >> g) & 1) {
++                s.xor_with(raw.generators[g]);
++            }
++        }
++        by_symptom[s.words] += p;
++        listed_total += p;
++    }
++    if (by_symptom.empty()) {
++        return false;
++    }
++    if (1 - listed_total > 1e-12) {
++        by_symptom[std::vector<uint64_t>((ctx.num_bits() + 63) / 64, 0)] += 1 - listed_total;
++    }
++    std::vector<Symptom> nonzero;
++    for (const auto &[w, p] : by_symptom) {
++        Symptom s(ctx.num_bits());
++        s.words = w;
++        if (!s.is_zero()) {
++            nonzero.push_back(std::move(s));
++        }
++    }
++    if (nonzero.empty()) {
++        return false;  // Invisible column.
++    }
++    out.basis = canonical_rref(nonzero, ctx.num_bits());
++    out.rank = out.basis.rank();
++    if (out.rank > MAX_RANK) {
++        throw std::invalid_argument(
++            "Non-binary DEM: a fault location reduced to rank " + std::to_string(out.rank) +
++            " > " + std::to_string(MAX_RANK) + ", which is not supported.");
++    }
++    out.prior.assign(1ULL << out.rank, 0.0);
++    for (const auto &[w, p] : by_symptom) {
++        Symptom s(ctx.num_bits());
++        s.words = w;
++        auto [coords, in_span] = out.basis.solve_coords(s);
++        if (!in_span) {
++            throw std::invalid_argument("Internal error: support point outside its own span.");
++        }
++        out.prior[coords] += p;
++    }
++    double total = 0;
++    for (double p : out.prior) {
++        total += p;
++    }
++    if (std::abs(total - 1.0) > 1e-9) {
++        throw std::invalid_argument(
++            "Non-binary DEM: channel probabilities of '" + raw.description +
++            "' sum to " + std::to_string(total) + " instead of 1.");
++    }
++    out.symptom_of_coord.assign(1ULL << out.rank, Symptom(ctx.num_bits()));
++    for (size_t u = 0; u < out.symptom_of_coord.size(); u++) {
++        for (size_t i = 0; i < out.rank; i++) {
++            if ((u >> i) & 1) {
++                out.symptom_of_coord[u].xor_with(out.basis.rows[i]);
++            }
++        }
++    }
++    out.order = raw.order;
++    out.origins = {raw.description};
++    out.tag = raw.tag;
++    out.native_generators = raw.generators;
++    out.native_labels = raw.generator_labels;
++    return true;
++}
++
++/// Tries to write the prior (over F_2^rank coordinates) as the XOR of
++/// independent binary parts. Returns part probabilities indexed by
++/// coordinate value (index 0 unused).
++bool try_factorize(const std::vector<double> &prior, size_t rank, std::vector<double> &out_part_probs) {
++    size_t n = 1ULL << rank;
++    if (rank == 1) {
++        out_part_probs.assign(2, 0.0);
++        out_part_probs[1] = prior[1];
++        return true;
++    }
++    std::vector<double> chi(n, 0.0);
++    for (size_t a = 0; a < n; a++) {
++        double acc = 0;
++        for (size_t u = 0; u < n; u++) {
++            acc += prior[u] * (((__builtin_popcountll(a & u) & 1) == 1) ? -1.0 : 1.0);
++        }
++        chi[a] = acc;
++    }
++    out_part_probs.assign(n, 0.0);
++    std::vector<double> ln_chi(n, 0.0);
++    for (size_t a = 1; a < n; a++) {
++        if (chi[a] < 1e-13) {
++            return false;  // No factorization with q_v in [0, 1/2).
++        }
++        ln_chi[a] = std::log(chi[a]);
++    }
++    double scale = std::ldexp(1.0, -(double)(rank - 1));
++    for (size_t v = 1; v < n; v++) {
++        // log(1 - 2 q_v) = -2^{1-r} * sum_{a != 0} (-1)^{<a,v>} log chi_a
++        double acc = 0;
++        for (size_t a = 1; a < n; a++) {
++            acc += ((__builtin_popcountll(a & v) & 1) == 1) ? -ln_chi[a] : ln_chi[a];
++        }
++        double one_minus_2q = std::exp(-scale * acc);
++        if (!(one_minus_2q >= -1e-12) || one_minus_2q > 1 + 1e-12) {
++            return false;
++        }
++        if (one_minus_2q < 0) {
++            one_minus_2q = 0;
++        }
++        if (one_minus_2q > 1) {
++            one_minus_2q = 1;
++        }
++        double q = (1 - one_minus_2q) * 0.5;
++        if (q >= 0.5) {
++            return false;
++        }
++        // Snap probabilities that only reflect floating point noise (the
++        // exact value is 0, but the character formula reproduces it only up
++        // to rounding) so that zero-probability parts are not emitted.
++        out_part_probs[v] = q < 1e-12 ? 0.0 : q;
++    }
++    // Numerical safety: the parts must reproduce the characters.
++    for (size_t a = 1; a < n; a++) {
++        double prod = 1.0;
++        for (size_t v = 1; v < n; v++) {
++            if ((__builtin_popcountll(a & v) & 1) == 1) {
++                prod *= 1 - 2 * out_part_probs[v];
++            }
++        }
++        if (std::abs(prod - chi[a]) > 1e-9) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/// A merged binary part during the regrouping step.
++struct MergedPart {
++    Symptom symptom;
++    double prob;
++    std::string tag;
++    std::string origin;
++    std::pair<size_t, size_t> origin_order;
++    int owner = -1;  // index of the claiming work column
++    /// All origin columns (locations whose parts were merged into this one).
++    std::vector<size_t> origins;
++};
++
++/// Data for one output column, ready for assembly.
++struct AssembleColumn {
++    std::pair<size_t, size_t> order;
++    std::vector<std::string> origins;
++    /// True: atoms are independent binary parts (atom probability = Bernoulli q).
++    /// False: atoms are support points of an exact prior (atom probability = mass).
++    bool from_parts;
++    std::vector<std::pair<Symptom, double>> atoms;
++    std::vector<Symptom> native_generators;
++    std::vector<std::string> native_labels;
++    /// For from_parts columns: indices into the global part list.
++    std::vector<size_t> part_ids;
++};
++
++/// Chooses the output basis of a column: prefers native generators (of the
++/// earliest origin) that lie inside the span, then rref rows.
++std::pair<std::vector<Symptom>, std::vector<std::string>> select_output_basis(
++    const std::vector<Symptom> &native_generators,
++    const std::vector<std::string> &native_labels,
++    const RrefBasis &span,
++    size_t num_bits) {
++    std::vector<Symptom> selected;
++    std::vector<std::string> labels;
++    auto try_add = [&](const Symptom &cand, const std::string &label) {
++        if (selected.size() == span.rank()) {
++            return;
++        }
++        std::vector<Symptom> test = selected;
++        test.push_back(cand);
++        if (canonical_rref(test, num_bits).rank() == selected.size() + 1) {
++            selected.push_back(cand);
++            labels.push_back(label);
++        }
++    };
++    for (size_t i = 0; i < native_generators.size(); i++) {
++        if (span.contains(native_generators[i])) {
++            try_add(native_generators[i], native_labels[i]);
++        }
++    }
++    for (const auto &row : span.rows) {
++        try_add(row, "");
++    }
++    if (selected.size() != span.rank()) {
++        throw std::invalid_argument("Internal error: output basis selection failed.");
++    }
++    bool all_native = true;
++    for (const auto &l : labels) {
++        if (l.empty()) {
++            all_native = false;
++            break;
++        }
++    }
++    if (!all_native) {
++        labels.clear();
++    }
++    return {selected, labels};
++}
++
++/// Renders an edge label as a Pauli string when the basis is the native
++/// generator basis of a single-qubit (rank 2: X@q, Z@q) or two-qubit
++/// (rank 4: X@a, Z@a, X@b, Z@b) Pauli channel, using the Kuo-Lai label
++/// convention: the label is the Pauli that the error anticommutes with,
++///     P_{d,c} = X^hz Z^hx per qubit,
++/// where hx is the label's coefficient of the X generator and hz of the Z
++/// generator (the error X^x Z^z anticommutes with X^hz Z^hx iff
++/// <h, u> = hx*x + hz*z = 1). A detector with label Z is flipped by X and Y
++/// errors, one with label X by Z and Y. Bases that do not have this form
++/// (e.g. a two-qubit channel reduced to generators X@a, X@b) are rendered as
++/// bit vectors over the basis.
++std::string render_label(uint64_t label, const std::vector<std::string> &generator_labels, size_t rank) {
++    auto parse = [&](const std::string &s, char &axis, uint32_t &q) -> bool {
++        if (s.size() < 3 || (s[0] != 'X' && s[0] != 'Z') || s[1] != '@') {
++            return false;
++        }
++        char *end;
++        unsigned long long v = std::strtoull(s.c_str() + 2, &end, 10);
++        if (*end != 0) {
++            return false;
++        }
++        axis = s[0];
++        q = (uint32_t)v;
++        return true;
++    };
++    bool pauli = generator_labels.size() == rank && (rank == 2 || rank == 4);
++    char axes[4];
++    uint32_t qs[4];
++    if (pauli) {
++        for (size_t i = 0; i < rank; i++) {
++            if (!parse(generator_labels[i], axes[i], qs[i])) {
++                pauli = false;
++                break;
++            }
++        }
++    }
++    if (pauli && rank == 2) {
++        pauli = axes[0] == 'X' && axes[1] == 'Z' && qs[0] == qs[1];
++    } else if (pauli && rank == 4) {
++        pauli = axes[0] == 'X' && axes[1] == 'Z' && qs[0] == qs[1] && axes[2] == 'X' && axes[3] == 'Z' &&
++            qs[2] == qs[3] && qs[0] != qs[2];
++    }
++    if (pauli) {
++        auto pauli_of = [](uint64_t h_x, uint64_t h_z) -> char {
++            // X^hz Z^hx.
++            if (h_x && h_z) {
++                return 'Y';
++            }
++            return h_x ? 'Z' : (h_z ? 'X' : 'I');
++        };
++        std::stringstream ss;
++        if (rank == 2) {
++            ss << pauli_of(label & 1, (label >> 1) & 1);
++        } else {
++            ss << pauli_of(label & 1, (label >> 1) & 1);
++            ss << pauli_of((label >> 2) & 1, (label >> 3) & 1);
++        }
++        return ss.str();
++    }
++    std::stringstream ss;
++    for (size_t i = 0; i < rank; i++) {
++        ss << ((label >> i) & 1);
++    }
++    return ss.str();
++}
++
++std::string format_double(double v) {
++    char buf[64];
++    snprintf(buf, sizeof(buf), "%.17g", v);
++    return buf;
++}
++
++/// Final assembly step shared by all merge modes.
++NonbinaryDem assemble_nonbinary_dem(
++    const NbDemContext &ctx,
++    NbDemOptions options,
++    std::vector<AssembleColumn> &assemble,
++    std::vector<MergedPart> &parts) {
++    NonbinaryDem result;
++    result.num_detectors = ctx.num_detectors;
++    result.num_observables = ctx.num_observables;
++    result.merge = options.merge;
++
++    for (auto &ac : assemble) {
++        // Span of the atoms.
++        std::vector<Symptom> atom_symptoms;
++        for (auto &[s, p] : ac.atoms) {
++            if (!s.is_zero()) {
++                atom_symptoms.push_back(s);
++            }
++        }
++        RrefBasis span = canonical_rref(atom_symptoms, ctx.num_bits());
++        if (span.rank() == 0) {
++            continue;  // All atoms invisible; drop the column.
++        }
++        size_t rank = span.rank();
++        auto [basis, labels] = select_output_basis(
++            ac.native_generators, ac.native_labels, span, ctx.num_bits());
++        AugmentedBasis solver = make_augmented_basis(basis, ctx.num_bits());
++
++        NbDemColumn out;
++        out.rank = (uint32_t)rank;
++        out.factorized = ac.from_parts;
++        out.origins = ac.origins;
++        out.generator_labels = labels;
++
++        // Prior: for part-based columns start at delta at coordinate 0 and
++        // convolve the parts; for support-based columns the atoms already
++        // include the identity mass, so just push them forward.
++        out.prior.assign(1ULL << rank, 0.0);
++        if (ac.from_parts) {
++            out.prior[0] = 1.0;
++        }
++        if (ac.from_parts) {
++            for (auto &[s, q] : ac.atoms) {
++                auto [coords, ok] = solver.solve(s);
++                if (!ok) {
++                    throw std::invalid_argument("Internal error: part outside rebuilt span.");
++                }
++                // prior <- (1-q)*prior + q*shift(prior, coords).
++                std::vector<double> next(1ULL << rank, 0.0);
++                for (size_t u = 0; u < out.prior.size(); u++) {
++                    next[u] += (1 - q) * out.prior[u];
++                    next[u ^ coords] += q * out.prior[u];
++                }
++                out.prior = std::move(next);
++            }
++        } else {
++            for (auto &[s, mass] : ac.atoms) {
++                auto [coords, ok] = solver.solve(s);
++                if (!ok) {
++                    throw std::invalid_argument("Internal error: support outside span.");
++                }
++                out.prior[coords] += mass;
++            }
++        }
++
++        // Edges: bit b of the symptom of basis row i contributes label bit i.
++        {
++            std::map<size_t, uint64_t> det_label;
++            std::map<size_t, uint64_t> obs_label;
++            for (size_t i = 0; i < basis.size(); i++) {
++                for (size_t b = 0; b < ctx.num_bits(); b++) {
++                    if (basis[i].get(b)) {
++                        if (b < ctx.num_detectors) {
++                            det_label[b] |= 1ULL << i;
++                        } else {
++                            obs_label[b - ctx.num_detectors] |= 1ULL << i;
++                        }
++                    }
++                }
++            }
++            for (auto &[d, label] : det_label) {
++                out.detector_edges.push_back({(uint32_t)d, label});
++            }
++            for (auto &[o, label] : obs_label) {
++                out.observable_edges.push_back({(uint32_t)o, label});
++            }
++        }
++
++        // Parts (for from_parts columns).
++        if (ac.from_parts) {
++            for (size_t pi : ac.part_ids) {
++                const MergedPart &part = parts[pi];
++                NbDemPart p;
++                p.probability = part.prob;
++                p.origin = part.origin;
++                p.tag = part.tag;
++                symptom_to_lists(ctx, part.symptom, p.flipped_detectors, p.flipped_observables);
++                out.parts.push_back(std::move(p));
++            }
++        }
++
++        result.columns.push_back(std::move(out));
++    }
++    return result;
++}
++
++}  // namespace
++
++namespace stim {
++
++NonbinaryDem circuit_to_nonbinary_dem(const Circuit &circuit, NbDemOptions options) {
++    // ------------------------------------------------------------------
++    // Phase 1: unroll loops, walk the circuit backward with Stim's error
++    // analyzer as a sensitivity tracker, and record one raw column per
++    // noise channel application.
++    // ------------------------------------------------------------------
++    Circuit flat = circuit.flattened();
++
++    NbDemContext ctx;
++    ctx.num_detectors = flat.count_detectors();
++    ctx.num_observables = flat.count_observables();
++
++    std::vector<RawColumn> raw_columns;
++
++    ErrorAnalyzer analyzer(
++        flat.count_measurements(),
++        ctx.num_detectors,
++        flat.count_qubits(),
++        flat.count_ticks(),
++        /*decompose_errors=*/false,
++        /*fold_loops=*/false,
++        options.allow_gauge_detectors,
++        /*approximate_disjoint_errors_threshold=*/1.0,
++        /*ignore_decomposition_failures=*/false,
++        /*block_decomposition_from_introducing_remnant_edges=*/false);
++    analyzer.accumulate_errors = false;
++    analyzer.current_circuit_being_analyzed = &flat;
++
++    auto sym_of_x_error = [&](uint32_t q) {
++        return symptom_from_targets(ctx, analyzer.tracker.zs[q].range());
++    };
++    auto sym_of_z_error = [&](uint32_t q) {
++        return symptom_from_targets(ctx, analyzer.tracker.xs[q].range());
++    };
++    auto sym_of_rec = [&](uint64_t rec) -> Symptom {
++        auto it = analyzer.tracker.rec_bits.find(rec);
++        if (it != analyzer.tracker.rec_bits.end()) {
++            return symptom_from_targets(ctx, it->second.range());
++        }
++        return Symptom(ctx.num_bits());
++    };
++
++    auto add_raw = [&](RawColumn &&col) {
++        raw_columns.push_back(std::move(col));
++    };
++
++    size_t num_ops = flat.operations.size();
++    std::vector<CircuitInstruction> pending_else_chain;
++
++    // Records the flip columns of a measurement instruction. For per_pair
++    // instructions (MXX/MYY/MZZ) each target pair produces one result.
++    auto record_measurement_flips = [&](const CircuitInstruction &op, size_t fwd_index, bool per_pair) {
++        if (op.args.empty() || op.args[0] <= 0) {
++            return;
++        }
++        uint64_t base = analyzer.tracker.num_measurements_in_past;
++        size_t num_results = per_pair ? op.targets.size() / 2 : op.targets.size();
++        for (size_t j = 0; j < num_results; j++) {
++            Symptom s = sym_of_rec(base - num_results + j);
++            if (s.is_zero()) {
++                continue;  // Nothing depends on this result.
++            }
++            RawColumn col;
++            uint32_t q = op.targets[per_pair ? 2 * j : j].qubit_value();
++            std::vector<GateTarget> tg{op.targets[per_pair ? 2 * j : j]};
++            if (per_pair) {
++                tg.push_back(op.targets[2 * j + 1]);
++            }
++            col.order = {fwd_index, j};
++            col.description = CircuitInstruction{op.gate_type, op.args, tg, op.tag}.str() + " (result flip)";
++            col.tag = std::string(op.tag);
++            col.generators = {s};
++            col.generator_labels = {"flip@" + std::to_string(q)};
++            col.prior = {{1, op.args[0]}};
++            add_raw(std::move(col));
++        }
++    };
++
++    for (size_t k = num_ops; k--;) {
++        const CircuitInstruction &op = flat.operations[k];
++        size_t fwd_index = k;
++
++        switch (op.gate_type) {
++            case GateType::X_ERROR:
++            case GateType::Y_ERROR:
++            case GateType::Z_ERROR: {
++                if (op.args.empty() || op.args[0] <= 0) {
++                    break;
++                }
++                for (size_t j = 0; j < op.targets.size(); j++) {
++                    uint32_t q = op.targets[j].qubit_value();
++                    RawColumn col;
++                    std::vector<GateTarget> tg{op.targets[j]};
++                    col.order = {fwd_index, j};
++                    col.description = CircuitInstruction{op.gate_type, op.args, tg, op.tag}.str();
++                    col.tag = std::string(op.tag);
++                    if (op.gate_type == GateType::X_ERROR) {
++                        col.generators = {sym_of_x_error(q)};
++                        col.generator_labels = {"X@" + std::to_string(q)};
++                        col.prior = {{1, op.args[0]}};
++                    } else if (op.gate_type == GateType::Z_ERROR) {
++                        col.generators = {sym_of_z_error(q)};
++                        col.generator_labels = {"Z@" + std::to_string(q)};
++                        col.prior = {{1, op.args[0]}};
++                    } else {
++                        col.generators = {sym_of_x_error(q), sym_of_z_error(q)};
++                        col.generator_labels = {"X@" + std::to_string(q), "Z@" + std::to_string(q)};
++                        col.prior = {{3, op.args[0]}};
++                    }
++                    add_raw(std::move(col));
++                }
++                break;
++            }
++
++            case GateType::DEPOLARIZE1:
++            case GateType::PAULI_CHANNEL_1: {
++                double px, py, pz;
++                if (op.gate_type == GateType::DEPOLARIZE1) {
++                    px = py = pz = op.args[0] / 3;
++                } else {
++                    px = op.args[0];
++                    py = op.args[1];
++                    pz = op.args[2];
++                }
++                if (px <= 0 && py <= 0 && pz <= 0) {
++                    break;
++                }
++                for (size_t j = 0; j < op.targets.size(); j++) {
++                    uint32_t q = op.targets[j].qubit_value();
++                    RawColumn col;
++                    std::vector<GateTarget> tg{op.targets[j]};
++                    col.order = {fwd_index, j};
++                    col.description = CircuitInstruction{op.gate_type, op.args, tg, op.tag}.str();
++                    col.tag = std::string(op.tag);
++                    // Coordinates: bit 0 = X component, bit 1 = Z component.
++                    col.generators = {sym_of_x_error(q), sym_of_z_error(q)};
++                    col.generator_labels = {"X@" + std::to_string(q), "Z@" + std::to_string(q)};
++                    if (px > 0) {
++                        col.prior.push_back({0b01, px});
++                    }
++                    if (pz > 0) {
++                        col.prior.push_back({0b10, pz});
++                    }
++                    if (py > 0) {
++                        col.prior.push_back({0b11, py});
++                    }
++                    add_raw(std::move(col));
++                }
++                break;
++            }
++
++            case GateType::DEPOLARIZE2:
++            case GateType::PAULI_CHANNEL_2: {
++                double p15[15];
++                bool all_zero = true;
++                if (op.gate_type == GateType::DEPOLARIZE2) {
++                    for (size_t t = 0; t < 15; t++) {
++                        p15[t] = op.args[0] / 15;
++                        all_zero &= p15[t] <= 0;
++                    }
++                } else {
++                    for (size_t t = 0; t < 15; t++) {
++                        p15[t] = op.args[t];
++                        all_zero &= p15[t] <= 0;
++                    }
++                }
++                if (all_zero) {
++                    break;
++                }
++                for (size_t j = 0; 2 * j + 1 < op.targets.size(); j++) {
++                    uint32_t qa = op.targets[2 * j].qubit_value();
++                    uint32_t qb = op.targets[2 * j + 1].qubit_value();
++                    RawColumn col;
++                    std::vector<GateTarget> tg{op.targets[2 * j], op.targets[2 * j + 1]};
++                    col.order = {fwd_index, j};
++                    col.description = CircuitInstruction{op.gate_type, op.args, tg, op.tag}.str();
++                    col.tag = std::string(op.tag);
++                    // Coordinates: bit0 = X@a, bit1 = Z@a, bit2 = X@b, bit3 = Z@b.
++                    col.generators = {
++                        sym_of_x_error(qa), sym_of_z_error(qa), sym_of_x_error(qb), sym_of_z_error(qb)};
++                    col.generator_labels = {
++                        "X@" + std::to_string(qa),
++                        "Z@" + std::to_string(qa),
++                        "X@" + std::to_string(qb),
++                        "Z@" + std::to_string(qb)};
++                    if (op.gate_type == GateType::DEPOLARIZE2) {
++                        for (uint64_t u = 1; u < 16; u++) {
++                            col.prior.push_back({u, p15[0]});
++                        }
++                    } else {
++                        // Argument t is the probability of the two-qubit Pauli
++                        // whose first-qubit (a) xyz code is ((t+1)>>2)&3 and
++                        // second-qubit (b) xyz code is (t+1)&3.
++                        for (size_t t = 0; t < 15; t++) {
++                            if (p15[t] <= 0) {
++                                continue;
++                            }
++                            uint64_t xz_a = pauli_xyz_to_xz(((t + 1) >> 2) & 3);
++                            uint64_t xz_b = pauli_xyz_to_xz((t + 1) & 3);
++                            uint64_t u = xz_a | (xz_b << 2);
++                            col.prior.push_back({u, p15[t]});
++                        }
++                    }
++                    add_raw(std::move(col));
++                }
++                break;
++            }
++
++            case GateType::HERALDED_ERASE:
++            case GateType::HERALDED_PAULI_CHANNEL_1: {
++                double pi_i, pi_x, pi_z, pi_y;
++                if (op.gate_type == GateType::HERALDED_ERASE) {
++                    double p = op.args[0];
++                    pi_i = pi_x = pi_z = pi_y = p / 4;
++                } else {
++                    pi_i = op.args[0];
++                    pi_x = op.args[1];
++                    pi_y = op.args[2];
++                    pi_z = op.args[3];
++                }
++                if (pi_i <= 0 && pi_x <= 0 && pi_y <= 0 && pi_z <= 0) {
++                    break;
++                }
++                uint64_t base = analyzer.tracker.num_measurements_in_past;
++                size_t T = op.targets.size();
++                for (size_t j = 0; j < T; j++) {
++                    uint32_t q = op.targets[j].qubit_value();
++                    RawColumn col;
++                    std::vector<GateTarget> tg{op.targets[j]};
++                    col.order = {fwd_index, j};
++                    col.description = CircuitInstruction{op.gate_type, op.args, tg, op.tag}.str();
++                    col.tag = std::string(op.tag);
++                    // Coordinates: bit0 = X@q, bit1 = Z@q, bit2 = herald record.
++                    Symptom herald = sym_of_rec(base - T + j);
++                    col.generators = {sym_of_x_error(q), sym_of_z_error(q), herald};
++                    col.generator_labels = {
++                        "X@" + std::to_string(q), "Z@" + std::to_string(q), "H@" + std::to_string(q)};
++                    if (pi_i > 0) {
++                        col.prior.push_back({0b100, pi_i});
++                    }
++                    if (pi_x > 0) {
++                        col.prior.push_back({0b101, pi_x});
++                    }
++                    if (pi_z > 0) {
++                        col.prior.push_back({0b110, pi_z});
++                    }
++                    if (pi_y > 0) {
++                        col.prior.push_back({0b111, pi_y});
++                    }
++                    add_raw(std::move(col));
++                }
++                break;
++            }
++
++            case GateType::M:
++            case GateType::MX:
++            case GateType::MY:
++            case GateType::MR:
++            case GateType::MRX:
++            case GateType::MRY: {
++                record_measurement_flips(op, fwd_index, false);
++                break;
++            }
++
++            case GateType::MXX:
++            case GateType::MYY:
++            case GateType::MZZ: {
++                record_measurement_flips(op, fwd_index, true);
++                break;
++            }
++
++            case GateType::MPP:
++            case GateType::SPP:
++            case GateType::SPP_DAG: {
++                if (!op.args.empty() && op.args[0] > 0) {
++                    throw std::invalid_argument(
++                        std::string("analyze_errors_nb: the noise argument of ") + op.str() +
++                        " is not supported by the non-binary detector error model construction.");
++                }
++                break;
++            }
++
++            case GateType::E:
++            case GateType::ELSE_CORRELATED_ERROR: {
++                pending_else_chain.push_back(op);
++                if (op.gate_type == GateType::E) {
++                    // Chain members in forward order: the E first, then the ELSEs.
++                    std::vector<CircuitInstruction> members(
++                        pending_else_chain.rbegin(), pending_else_chain.rend());
++                    pending_else_chain.clear();
++                    // Conditional (disjoint) probabilities.
++                    double remaining = 1.0;
++                    std::vector<double> conditional;
++                    for (const auto &m : members) {
++                        double p = m.args[0];
++                        conditional.push_back(p * remaining);
++                        remaining *= 1 - p;
++                    }
++                    // One raw column per chain: generators are the per-qubit
++                    // X/Z Pauli components, in order of first appearance; the
++                    // prior is the exact disjoint distribution.
++                    RawColumn col;
++                    col.order = {fwd_index, 0};
++                    col.tag = std::string(members[0].tag);
++                    col.description = members[0].str();
++                    for (size_t mi = 1; mi < members.size(); mi++) {
++                        col.description += " ; " + members[mi].str();
++                    }
++                    auto find_or_add_generator = [&](const Symptom &s, const std::string &label) -> size_t {
++                        for (size_t i = 0; i < col.generator_labels.size(); i++) {
++                            if (col.generator_labels[i] == label) {
++                                return i;
++                            }
++                        }
++                        col.generators.push_back(s);
++                        col.generator_labels.push_back(label);
++                        return col.generators.size() - 1;
++                    };
++                    for (size_t mi = 0; mi < members.size(); mi++) {
++                        const auto &m = members[mi];
++                        uint64_t coords = 0;
++                        for (auto t : m.targets) {
++                            uint32_t q = t.qubit_value();
++                            bool px = (t.data & TARGET_PAULI_X_BIT) != 0;
++                            bool pz = (t.data & TARGET_PAULI_Z_BIT) != 0;
++                            if (px) {
++                                size_t g = find_or_add_generator(sym_of_x_error(q), "X@" + std::to_string(q));
++                                coords |= 1ULL << g;
++                            }
++                            if (pz) {
++                                size_t g = find_or_add_generator(sym_of_z_error(q), "Z@" + std::to_string(q));
++                                coords |= 1ULL << g;
++                            }
++                        }
++                        if (conditional[mi] > 0) {
++                            col.prior.push_back({coords, conditional[mi]});
++                        }
++                    }
++                    if (col.generators.size() > 64) {
++                        throw std::invalid_argument(
++                            "analyze_errors_nb: CORRELATED_ERROR chain with more than 64 generators "
++                            "is not supported.");
++                    }
++                    add_raw(std::move(col));
++                }
++                break;
++            }
++
++            default:
++                if (!pending_else_chain.empty()) {
++                    throw std::invalid_argument(
++                        "ELSE_CORRELATED_ERROR wasn't preceded by ELSE_CORRELATED_ERROR or "
++                        "CORRELATED_ERROR (E)");
++                }
++                break;
++        }
++
++        if (op.gate_type != GateType::E && op.gate_type != GateType::ELSE_CORRELATED_ERROR) {
++            analyzer.undo_gate(op);
++        }
++    }
++    if (!pending_else_chain.empty()) {
++        throw std::invalid_argument(
++            "ELSE_CORRELATED_ERROR wasn't preceded by ELSE_CORRELATED_ERROR or CORRELATED_ERROR (E)");
++    }
++    analyzer.post_check_initialization();
++
++    // ------------------------------------------------------------------
++    // Phase 2: reduce raw columns.
++    // ------------------------------------------------------------------
++    std::vector<WorkColumn> columns;
++    for (const auto &raw : raw_columns) {
++        WorkColumn col;
++        if (reduce_raw_column(ctx, raw, col)) {
++            columns.push_back(std::move(col));
++        }
++    }
++
++    if (options.merge == NbDemMergeMode::PARTS) {
++        // --------------------------------------------------------------
++        // Split every factorizable location into its independent binary
++        // parts, merge parts with equal symptoms, assign each merged part
++        // to its origin location of largest rank (ties: earlier circuit
++        // position), and regroup.
++        // --------------------------------------------------------------
++        std::vector<MergedPart> parts;
++        std::map<std::pair<std::vector<uint64_t>, std::string>, size_t> part_index;
++        std::vector<size_t> factorized_indices;
++        std::vector<size_t> kept_whole_indices;
++        for (size_t ci = 0; ci < columns.size(); ci++) {
++            WorkColumn &col = columns[ci];
++            std::vector<double> part_probs;
++            if (try_factorize(col.prior, col.rank, part_probs)) {
++                col.factorized = true;
++                factorized_indices.push_back(ci);
++                for (size_t v = 1; v < (1ULL << col.rank); v++) {
++                    double q = part_probs[v];
++                    if (q <= 0) {
++                        continue;
++                    }
++                    Symptom symptom = col.symptom_of_coord[v];
++                    if (symptom.is_zero()) {
++                        continue;
++                    }
++                    auto key = std::make_pair(symptom.words, col.tag);
++                    auto it = part_index.find(key);
++                    if (it == part_index.end()) {
++                        part_index[key] = parts.size();
++                        parts.push_back(
++                            MergedPart{std::move(symptom), q, col.tag, col.origins[0], col.order, -1, {ci}});
++                    } else {
++                        MergedPart &dst = parts[it->second];
++                        dst.prob = xor_merge_probs(dst.prob, q);
++                        if (col.order < dst.origin_order) {
++                            dst.origin = col.origins[0];
++                            dst.origin_order = col.order;
++                        }
++                        dst.origins.push_back(ci);
++                    }
++                }
++            } else {
++                col.factorized = false;
++                kept_whole_indices.push_back(ci);
++            }
++        }
++
++        // Assign every merged part to its origin location of largest rank,
++        // breaking ties by circuit order in favor of the earlier location.
++        // Locations that were kept whole do not claim parts.
++        for (auto &part : parts) {
++            size_t best = part.origins[0];
++            for (size_t oi = 1; oi < part.origins.size(); oi++) {
++                size_t cand = part.origins[oi];
++                if (columns[cand].rank > columns[best].rank ||
++                    (columns[cand].rank == columns[best].rank &&
++                     columns[cand].order < columns[best].order)) {
++                    best = cand;
++                }
++            }
++            part.owner = (int)best;
++        }
++
++        // Rebuild the factorized columns from their assigned parts.
++        std::vector<AssembleColumn> assemble;
++        for (size_t ci : factorized_indices) {
++            std::vector<size_t> claimed;
++            for (size_t pi = 0; pi < parts.size(); pi++) {
++                if (parts[pi].owner == (int)ci) {
++                    claimed.push_back(pi);
++                }
++            }
++            if (claimed.empty()) {
++                continue;  // Location fully absorbed by other locations.
++            }
++            AssembleColumn ac;
++            ac.order = columns[ci].order;
++            ac.origins = columns[ci].origins;
++            ac.from_parts = true;
++            ac.native_generators = columns[ci].native_generators;
++            ac.native_labels = columns[ci].native_labels;
++            ac.part_ids = claimed;
++            for (size_t pi : claimed) {
++                ac.atoms.push_back({parts[pi].symptom, parts[pi].prob});
++            }
++            assemble.push_back(std::move(ac));
++        }
++        for (size_t ci : kept_whole_indices) {
++            AssembleColumn ac;
++            ac.order = columns[ci].order;
++            ac.origins = columns[ci].origins;
++            ac.from_parts = false;
++            ac.native_generators = columns[ci].native_generators;
++            ac.native_labels = columns[ci].native_labels;
++            for (size_t u = 0; u < columns[ci].prior.size(); u++) {
++                if (columns[ci].prior[u] > 0) {
++                    ac.atoms.push_back({columns[ci].symptom_of_coord[u], columns[ci].prior[u]});
++                }
++            }
++            assemble.push_back(std::move(ac));
++        }
++
++        std::stable_sort(assemble.begin(), assemble.end(), [](const AssembleColumn &a, const AssembleColumn &b) {
++            return a.order < b.order;
++        });
++        return assemble_nonbinary_dem(ctx, options, assemble, parts);
++    }
++
++    // ------------------------------------------------------------------
++    // Merge mode NONE / COLUMNS: assemble directly from the columns.
++    // ------------------------------------------------------------------
++    if (options.merge == NbDemMergeMode::COLUMNS) {
++        std::map<std::vector<std::vector<uint64_t>>, size_t> span_to_index;
++        std::vector<WorkColumn> merged;
++        for (auto &col : columns) {
++            std::vector<std::vector<uint64_t>> key;
++            for (const auto &row : col.basis.rows) {
++                key.push_back(row.words);
++            }
++            auto it = span_to_index.find(key);
++            if (it == span_to_index.end()) {
++                span_to_index[key] = merged.size();
++                merged.push_back(std::move(col));
++            } else {
++                WorkColumn &dst = merged[it->second];
++                dst.prior = xor_convolve(dst.prior, col.prior);
++                if (col.order < dst.order) {
++                    dst.order = col.order;
++                    dst.tag = col.tag;
++                    dst.native_generators = col.native_generators;
++                    dst.native_labels = col.native_labels;
++                    dst.origins.insert(dst.origins.begin(), col.origins.begin(), col.origins.end());
++                } else {
++                    dst.origins.insert(dst.origins.end(), col.origins.begin(), col.origins.end());
++                }
++            }
++        }
++        columns = std::move(merged);
++    }
++
++    std::vector<AssembleColumn> assemble;
++    for (auto &col : columns) {
++        AssembleColumn ac;
++        ac.order = col.order;
++        ac.origins = col.origins;
++        ac.from_parts = false;
++        ac.native_generators = col.native_generators;
++        ac.native_labels = col.native_labels;
++        for (size_t u = 0; u < col.prior.size(); u++) {
++            if (col.prior[u] > 0) {
++                ac.atoms.push_back({col.symptom_of_coord[u], col.prior[u]});
++            }
++        }
++        assemble.push_back(std::move(ac));
++    }
++    std::vector<MergedPart> no_parts;
++    return assemble_nonbinary_dem(ctx, options, assemble, no_parts);
++}
++
++DetectorErrorModel NonbinaryDem::binary_image() const {
++    struct Entry {
++        double probability;
++        std::vector<DemTarget> targets;
++        std::string tag;
++    };
++    std::vector<Entry> entries;
++    for (const auto &col : columns) {
++        for (const auto &part : col.parts) {
++            if (part.probability <= 0) {
++                continue;
++            }
++            if (part.flipped_detectors.empty() && part.flipped_observables.empty()) {
++                continue;
++            }
++            Entry e;
++            e.probability = part.probability;
++            e.tag = part.tag;
++            for (uint32_t d : part.flipped_detectors) {
++                e.targets.push_back(DemTarget::relative_detector_id(d));
++            }
++            for (uint32_t o : part.flipped_observables) {
++                e.targets.push_back(DemTarget::observable_id(o));
++            }
++            entries.push_back(std::move(e));
++        }
++    }
++    std::sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) {
++        // Sort by (targets, tag), matching Stim's detector error model order.
++        size_t n = std::min(a.targets.size(), b.targets.size());
++        for (size_t k = 0; k < n; k++) {
++            if (!(a.targets[k] == b.targets[k])) {
++                return a.targets[k] < b.targets[k];
++            }
++        }
++        if (a.targets.size() != b.targets.size()) {
++            return a.targets.size() < b.targets.size();
++        }
++        return a.tag < b.tag;
++    });
++    DetectorErrorModel out;
++    for (const auto &e : entries) {
++        out.append_error_instruction(e.probability, e.targets, e.tag);
++    }
++    return out;
++}
++
++size_t NonbinaryDem::num_detector_edges() const {
++    size_t total = 0;
++    for (const auto &col : columns) {
++        total += col.detector_edges.size();
++    }
++    return total;
++}
++
++namespace {
++std::string json_escape(const std::string &s) {
++    std::stringstream ss;
++    for (char c : s) {
++        switch (c) {
++            case '"':
++                ss << "\\\"";
++                break;
++            case '\\':
++                ss << "\\\\";
++                break;
++            case '\n':
++                ss << "\\n";
++                break;
++            case '\t':
++                ss << "\\t";
++                break;
++            default:
++                if ((unsigned char)c < 0x20) {
++                    char buf[8];
++                    snprintf(buf, sizeof(buf), "\\u%04x", c);
++                    ss << buf;
++                } else {
++                    ss << c;
++                }
++        }
++    }
++    return ss.str();
++}
++}  // namespace
++
++std::string NonbinaryDem::to_json() const {
++    std::stringstream ss;
++    ss << "{\"num_detectors\":" << num_detectors << ",\"num_observables\":" << num_observables
++       << ",\"merge\":\"";
++    switch (merge) {
++        case NbDemMergeMode::NONE:
++            ss << "none";
++            break;
++        case NbDemMergeMode::COLUMNS:
++            ss << "columns";
++            break;
++        case NbDemMergeMode::PARTS:
++            ss << "parts";
++            break;
++    }
++    ss << "\",\"columns\":[";
++    for (size_t c = 0; c < columns.size(); c++) {
++        const auto &col = columns[c];
++        if (c) {
++            ss << ",";
++        }
++        ss << "{\"rank\":" << col.rank << ",\"factorized\":" << (col.factorized ? "true" : "false")
++           << ",\"prior\":[";
++        for (size_t u = 0; u < col.prior.size(); u++) {
++            if (u) {
++                ss << ",";
++            }
++            ss << format_double(col.prior[u]);
++        }
++        ss << "],\"detector_edges\":[";
++        for (size_t e = 0; e < col.detector_edges.size(); e++) {
++            if (e) {
++                ss << ",";
++            }
++            ss << "[" << col.detector_edges[e].first << ",\""
++               << render_label(col.detector_edges[e].second, col.generator_labels, col.rank) << "\"]";
++        }
++        ss << "],\"observable_edges\":[";
++        for (size_t e = 0; e < col.observable_edges.size(); e++) {
++            if (e) {
++                ss << ",";
++            }
++            ss << "[" << col.observable_edges[e].first << ",\""
++               << render_label(col.observable_edges[e].second, col.generator_labels, col.rank) << "\"]";
++        }
++        ss << "],\"generator_labels\":[";
++        for (size_t g = 0; g < col.generator_labels.size(); g++) {
++            if (g) {
++                ss << ",";
++            }
++            ss << "\"" << json_escape(col.generator_labels[g]) << "\"";
++        }
++        ss << "],\"origins\":[";
++        for (size_t o = 0; o < col.origins.size(); o++) {
++            if (o) {
++                ss << ",";
++            }
++            ss << "\"" << json_escape(col.origins[o]) << "\"";
++        }
++        ss << "],\"parts\":[";
++        for (size_t p = 0; p < col.parts.size(); p++) {
++            if (p) {
++                ss << ",";
++            }
++            ss << "{\"probability\":" << format_double(col.parts[p].probability)
++               << ",\"flipped_detectors\":[";
++            for (size_t d = 0; d < col.parts[p].flipped_detectors.size(); d++) {
++                if (d) {
++                    ss << ",";
++                }
++                ss << col.parts[p].flipped_detectors[d];
++            }
++            ss << "],\"flipped_observables\":[";
++            for (size_t d = 0; d < col.parts[p].flipped_observables.size(); d++) {
++                if (d) {
++                    ss << ",";
++                }
++                ss << col.parts[p].flipped_observables[d];
++            }
++            ss << "],\"origin\":\"" << json_escape(col.parts[p].origin) << "\"}";
++        }
++        ss << "]}";
++    }
++    ss << "]}";
++    return ss.str();
++}
++
++std::string NonbinaryDem::str() const {
++    std::stringstream ss;
++    ss << "nb_detector_error_model num_detectors=" << num_detectors << " num_observables=" << num_observables
++       << " merge=";
++    switch (merge) {
++        case NbDemMergeMode::NONE:
++            ss << "none";
++            break;
++        case NbDemMergeMode::COLUMNS:
++            ss << "columns";
++            break;
++        case NbDemMergeMode::PARTS:
++            ss << "parts";
++            break;
++    }
++    ss << " num_columns=" << columns.size() << "\n";
++    for (size_t c = 0; c < columns.size(); c++) {
++        const auto &col = columns[c];
++        ss << "column[" << c << "] rank=" << col.rank << " factorized=" << (col.factorized ? "yes" : "no")
++           << "\n";
++        ss << "  prior";
++        for (double p : col.prior) {
++            ss << " " << format_double(p);
++        }
++        ss << "\n";
++        for (const auto &[d, label] : col.detector_edges) {
++            ss << "  det_edge D" << d << " " << render_label(label, col.generator_labels, col.rank) << "\n";
++        }
++        for (const auto &[o, label] : col.observable_edges) {
++            ss << "  obs_edge L" << o << " " << render_label(label, col.generator_labels, col.rank) << "\n";
++        }
++        for (const auto &g : col.generator_labels) {
++            ss << "  generator " << g << "\n";
++        }
++        for (const auto &o : col.origins) {
++            ss << "  origin " << o << "\n";
++        }
++        for (const auto &part : col.parts) {
++            ss << "  part " << format_double(part.probability);
++            for (uint32_t d : part.flipped_detectors) {
++                ss << " D" << d;
++            }
++            for (uint32_t o : part.flipped_observables) {
++                ss << " L" << o;
++            }
++            ss << "\n";
++        }
++    }
++    return ss.str();
++}
++
++}  // namespace stim
+diff --git a/src/stim/util_top/circuit_to_nb_dem.h b/src/stim/util_top/circuit_to_nb_dem.h
+new file mode 100644
+index 0000000..6d1bde5
+--- /dev/null
++++ b/src/stim/util_top/circuit_to_nb_dem.h
+@@ -0,0 +1,149 @@
++/*
++ * Non-binary detector error models (NB-DEM).
++ *
++ * Implements the split-merge-regroup construction of
++ * "Non-Binary Detector Error Models" (Tinelli, Lazaro, Garcia Herrero).
++ *
++ * A non-binary DEM is a list of columns (pi_c, H_c, L_c). Column c is a random
++ * variable u_c in F_2^{r_c} with prior pi_c, and
++ *     s = sum_c H_c u_c,   l = sum_c L_c u_c.
++ * Each column of rank r=2/4 corresponds to a single-qubit/two-qubit Pauli
++ * channel with its exact prior (generators X, Z per qubit); rank-1 columns are
++ * ordinary binary mechanisms. The construction splits factorizable columns
++ * into their independent binary parts, merges parts with equal symptoms (as
++ * Stim does), assigns each merged part to its origin location of largest rank
++ * (ties: earlier circuit position), and rebuilds
++ * the locations from their assigned parts, preserving the joint law
++ * P(s, l) exactly.
++ *
++ * Copyright 2026 DLR.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _STIM_UTIL_TOP_CIRCUIT_TO_NB_DEM_H
++#define _STIM_UTIL_TOP_CIRCUIT_TO_NB_DEM_H
++
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "stim/circuit/circuit.h"
++#include "stim/dem/detector_error_model.h"
++
++namespace stim {
++
++/// Which merging steps of the split-merge-regroup procedure to apply.
++enum class NbDemMergeMode {
++    /// One (reduced) raw column per noise channel application. No merging.
++    NONE,
++    /// Only merge columns with equal span (the paper's weaker merging variant).
++    COLUMNS,
++    /// Full split-merge-regroup (default; the paper's Algorithm).
++    PARTS,
++};
++
++/// Options for the non-binary detector error model construction.
++struct NbDemOptions {
++    /// Merging strategy. See NbDemMergeMode.
++    NbDemMergeMode merge = NbDemMergeMode::PARTS;
++    /// When true, non-deterministic detectors are replaced by 50/50 error mechanisms
++    /// instead of causing failure.
++    bool allow_gauge_detectors = false;
++};
++
++/// A binary part (independent mechanism) claimed by a column of the non-binary DEM.
++struct NbDemPart {
++    /// Probability of the part firing.
++    double probability;
++    /// Sorted detector indices flipped by the part.
++    std::vector<uint32_t> flipped_detectors;
++    /// Sorted observable indices flipped by the part.
++    std::vector<uint32_t> flipped_observables;
++    /// Description of the origin location that contributed the part.
++    std::string origin;
++    /// The tag of the noise instruction that contributed the part.
++    std::string tag;
++};
++
++/// One column of a non-binary detector error model.
++struct NbDemColumn {
++    /// The rank r_c of the column (number of basis generators).
++    uint32_t rank = 0;
++    /// The prior pi_c as a table of 2^rank probabilities, indexed by the coordinate
++    /// vector u in F_2^rank (bit i of the index = coefficient of basis generator i).
++    std::vector<double> prior;
++    /// Detector edges: (detector index, label). The label is the row of H_c, stored as
++    /// a bit vector over the basis generators (bit i = coefficient of generator i).
++    /// Detector d is flipped by u iff popcount(label & u) is odd.
++    std::vector<std::pair<uint32_t, uint64_t>> detector_edges;
++    /// Observable edges: (observable index, label), with the same semantics.
++    std::vector<std::pair<uint32_t, uint64_t>> observable_edges;
++    /// The independent binary parts claimed by this column during regrouping.
++    /// Empty for columns that were kept whole (non-factorizable channels).
++    std::vector<NbDemPart> parts;
++    /// False iff the column's channel does not factorize into independent binary
++    /// parts and the column was therefore kept whole with its exact prior.
++    bool factorized = true;
++    /// Descriptions of the origin locations merged into this column.
++    std::vector<std::string> origins;
++    /// Human readable description of the basis generators (e.g. "X@4", "Z@4"),
++    /// when the basis is the native generator basis of a Pauli channel.
++    /// Empty when the basis is a generic reduced basis.
++    std::vector<std::string> generator_labels;
++
++    /// The prior as a probability of each coordinate. Same as `prior`.
++    const std::vector<double> &prior_table() const {
++        return prior;
++    }
++};
++
++/// A non-binary detector error model.
++struct NonbinaryDem {
++    /// The number of detectors in the circuit.
++    size_t num_detectors = 0;
++    /// The number of logical observables in the circuit.
++    size_t num_observables = 0;
++    /// The merge mode used to construct this model.
++    NbDemMergeMode merge = NbDemMergeMode::PARTS;
++    /// The columns of the model.
++    std::vector<NbDemColumn> columns;
++
++    /// The merged binary parts, as a stim.DetectorErrorModel (error instructions only).
++    /// This is the "binary image" of the non-binary DEM: for circuits whose channels
++    /// factorize it is statistically identical to Stim's detector error model.
++    DetectorErrorModel binary_image() const;
++
++    /// Total number of detector-variable edges of the Tanner graph.
++    size_t num_detector_edges() const;
++
++    /// Human readable text format.
++    std::string str() const;
++
++    /// Machine readable JSON format.
++    std::string to_json() const;
++};
++
++/// Computes the non-binary detector error model of a circuit.
++///
++/// Args:
++///     circuit: The circuit to analyze. Its loops are unrolled.
++///     options: Construction options (merge mode, gauge detectors).
++///
++/// Returns:
++///     The non-binary detector error model.
++NonbinaryDem circuit_to_nonbinary_dem(const Circuit &circuit, NbDemOptions options = {});
++
++}  // namespace stim
++
++#endif
+diff --git a/src/stim/util_top/circuit_to_nb_dem.pybind.cc b/src/stim/util_top/circuit_to_nb_dem.pybind.cc
+new file mode 100644
+index 0000000..b4c49c7
+--- /dev/null
++++ b/src/stim/util_top/circuit_to_nb_dem.pybind.cc
+@@ -0,0 +1,216 @@
++/*
++ * Copyright 2026 DLR.
++ *
++ * Python bindings for the non-binary detector error model.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "stim/util_top/circuit_to_nb_dem.pybind.h"
++
++#include "stim/dem/detector_error_model.pybind.h"
++
++using namespace stim;
++using namespace stim_pybind;
++
++pybind11::dict column_to_dict(const NbDemColumn &col) {
++    pybind11::dict out;
++    out["rank"] = col.rank;
++    out["factorized"] = col.factorized;
++    pybind11::list prior;
++    for (double p : col.prior) {
++        prior.append(p);
++    }
++    out["prior"] = prior;
++    pybind11::list det_edges;
++    for (const auto &[d, label] : col.detector_edges) {
++        det_edges.append(pybind11::make_tuple(d, label));
++    }
++    out["detector_edges"] = det_edges;
++    pybind11::list obs_edges;
++    for (const auto &[o, label] : col.observable_edges) {
++        obs_edges.append(pybind11::make_tuple(o, label));
++    }
++    out["observable_edges"] = obs_edges;
++    pybind11::list labels;
++    for (const auto &g : col.generator_labels) {
++        labels.append(g);
++    }
++    out["generator_labels"] = labels;
++    pybind11::list origins;
++    for (const auto &g : col.origins) {
++        origins.append(g);
++    }
++    out["origins"] = origins;
++    pybind11::list parts;
++    for (const auto &part : col.parts) {
++        pybind11::dict pd;
++        pd["probability"] = part.probability;
++        pybind11::list dets;
++        for (uint32_t d : part.flipped_detectors) {
++            dets.append(d);
++        }
++        pd["flipped_detectors"] = dets;
++        pybind11::list obs;
++        for (uint32_t o : part.flipped_observables) {
++            obs.append(o);
++        }
++        pd["flipped_observables"] = obs;
++        pd["origin"] = part.origin;
++        parts.append(pd);
++    }
++    out["parts"] = parts;
++    return out;
++}
++
++pybind11::class_<NonbinaryDem> stim_pybind::pybind_nonbinary_dem(pybind11::module &m) {
++    return pybind11::class_<NonbinaryDem>(
++        m,
++        "NonbinaryDem",
++        clean_doc_string(R"DOC(
++            A non-binary detector error model.
++
++            Each column of the model is a random variable u in F_2^r with a prior
++            distribution over its 2^r values, together with linear maps H_c, L_c
++            from F_2^r into detectors and observables. The variables are
++            independent and
++
++                s = sum_c H_c u_c        (syndrome)
++                l = sum_c L_c u_c        (logical flips)
++
++            The detector d is flipped by u iff popcount(label_and_u) is odd,
++            where the label is the row of H_c stored on the detector's edge.
++
++            Examples:
++                >>> import stim
++                >>> circuit = stim.Circuit('''
++                ...     R 0 1
++                ...     DEPOLARIZE2(0.01) 0 1
++                ...     M 0 1
++                ...     DETECTOR rec[-2]
++                ...     DETECTOR rec[-1]
++                ... ''')
++                >>> model = circuit.nonbinary_detector_error_model()
++                >>> len(model)
++                1
++        )DOC")
++            .data());
++}
++
++namespace {
++
++void pybind_nonbinary_dem_methods(pybind11::module &m, pybind11::class_<NonbinaryDem> &c) {
++    c.def(
++        "to_dict",
++        [](const NonbinaryDem &self) {
++            pybind11::dict out;
++            out["num_detectors"] = self.num_detectors;
++            out["num_observables"] = self.num_observables;
++            out["merge"] = self.merge == NbDemMergeMode::NONE
++                ? "none"
++                : (self.merge == NbDemMergeMode::COLUMNS ? "columns" : "parts");
++            pybind11::list cols;
++            for (const auto &col : self.columns) {
++                cols.append(column_to_dict(col));
++            }
++            out["columns"] = cols;
++            return out;
++        },
++        clean_doc_string(R"DOC(
++            Returns a JSON-serializable dictionary describing the model.
++
++            Each column is described by its rank, prior (2^rank probabilities),
++            detector and observable edges with their labels, generator labels,
++            origins, and the binary parts it claimed during construction.
++        )DOC")
++            .data());
++
++    c.def(
++        "to_json",
++        [](const NonbinaryDem &self) {
++            return self.to_json();
++        },
++        clean_doc_string(R"DOC(
++            Returns the model as a JSON string.
++        )DOC")
++            .data());
++
++    c.def(
++        "binary_image",
++        [](const NonbinaryDem &self) {
++            return self.binary_image();
++        },
++        clean_doc_string(R"DOC(
++            Returns the merged binary parts as a stim.DetectorErrorModel.
++
++            This is the "binary image" of the model: for circuits whose channels
++            factorize it is statistically identical to Stim's detector error
++            model. Only error instructions are included.
++        )DOC")
++            .data());
++
++    c.def(
++        "num_columns",
++        [](const NonbinaryDem &self) {
++            return self.columns.size();
++        },
++        clean_doc_string(R"DOC(
++            Returns the number of columns (variable nodes) of the model.
++        )DOC")
++            .data());
++
++    c.def(
++        "num_detector_edges",
++        [](const NonbinaryDem &self) {
++            return self.num_detector_edges();
++        },
++        clean_doc_string(R"DOC(
++            Returns the number of detector-variable edges of the Tanner graph.
++        )DOC")
++            .data());
++
++    c.def(
++        "column",
++        [](const NonbinaryDem &self, size_t index) {
++            if (index >= self.columns.size()) {
++                throw std::invalid_argument("Column index out of range.");
++            }
++            return column_to_dict(self.columns[index]);
++        },
++        clean_doc_string(R"DOC(
++            Returns a dictionary describing one column of the model.
++
++            Args:
++                index: The index of the column.
++        )DOC")
++            .data());
++
++    c.def("__len__", [](const NonbinaryDem &self) {
++        return self.columns.size();
++    });
++
++    c.def("__str__", [](const NonbinaryDem &self) {
++        return self.str();
++    });
++
++    c.def_readonly("num_detectors", &NonbinaryDem::num_detectors, "The number of detectors.");
++    c.def_readonly("num_observables", &NonbinaryDem::num_observables, "The number of observables.");
++}
++
++}  // namespace
++
++// Called from stim.pybind.cc after pybind_nonbinary_dem.
++void stim_pybind::pybind_nonbinary_dem_method_defs(pybind11::module &m) {
++    auto c = pybind_nonbinary_dem(m);
++    pybind_nonbinary_dem_methods(m, c);
++}
+diff --git a/src/stim/util_top/circuit_to_nb_dem.pybind.h b/src/stim/util_top/circuit_to_nb_dem.pybind.h
+new file mode 100644
+index 0000000..cc5c50a
+--- /dev/null
++++ b/src/stim/util_top/circuit_to_nb_dem.pybind.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026 DLR.
++ *
++ * Python bindings for the non-binary detector error model.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _STIM_UTIL_TOP_CIRCUIT_TO_NB_DEM_PYBIND_H
++#define _STIM_UTIL_TOP_CIRCUIT_TO_NB_DEM_PYBIND_H
++
++#include "stim/py/base.pybind.h"
++#include "stim/util_top/circuit_to_nb_dem.h"
++
++namespace stim_pybind {
++
++pybind11::class_<stim::NonbinaryDem> pybind_nonbinary_dem(pybind11::module &m);
++void pybind_nonbinary_dem_method_defs(pybind11::module &m);
++
++}  // namespace stim_pybind
++
++#endif
+diff --git a/src/stim/util_top/circuit_to_nb_dem.test.cc b/src/stim/util_top/circuit_to_nb_dem.test.cc
+new file mode 100644
+index 0000000..e1eaf22
+--- /dev/null
++++ b/src/stim/util_top/circuit_to_nb_dem.test.cc
+@@ -0,0 +1,585 @@
++/*
++ * Tests for the non-binary detector error model construction.
++ *
++ * Copyright 2026 DLR.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "stim/util_top/circuit_to_nb_dem.h"
++
++#include <cmath>
++#include <random>
++#include <set>
++
++#include "gtest/gtest.h"
++#include "stim/util_top/circuit_to_dem.h"
++
++using namespace stim;
++
++namespace {
++
++/// Compares the error instructions of two detector error models (allowing a
++/// probability tolerance, since the XOR-merge order differs).
++void expect_dem_errors_equal(const DetectorErrorModel &a, const DetectorErrorModel &b) {
++    auto errors_of = [](const DetectorErrorModel &m) {
++        std::vector<std::pair<std::vector<DemTarget>, double>> out;
++        for (const auto &e : m.instructions) {
++            if (e.type != DemInstructionType::DEM_ERROR) {
++                continue;
++            }
++            std::vector<DemTarget> targets(e.target_data.begin(), e.target_data.end());
++            out.push_back({targets, e.arg_data[0]});
++        }
++        return out;
++    };
++    auto ea = errors_of(a);
++    auto eb = errors_of(b);
++    ASSERT_EQ(ea.size(), eb.size());
++    for (size_t k = 0; k < ea.size(); k++) {
++        ASSERT_EQ(ea[k].first, eb[k].first) << "Target mismatch at error " << k;
++        ASSERT_NEAR(ea[k].second, eb[k].second, 1e-12) << "Probability mismatch at error " << k;
++    }
++}
++
++/// Computes E[(-1)^{<f, (s, l)>}] for a non-binary dem, where f selects a set
++/// of detectors and observables.
++double nb_parity_expectation(
++    const NonbinaryDem &nb, const std::vector<bool> &det_mask, const std::vector<bool> &obs_mask) {
++    double result = 1;
++    for (const auto &col : nb.columns) {
++        uint64_t t = 0;
++        for (const auto &[d, label] : col.detector_edges) {
++            if (det_mask[d]) {
++                t ^= label;
++            }
++        }
++        for (const auto &[o, label] : col.observable_edges) {
++            if (obs_mask[o]) {
++                t ^= label;
++            }
++        }
++        if (t == 0) {
++            continue;
++        }
++        double acc = 0;
++        for (size_t u = 0; u < col.prior.size(); u++) {
++            acc += col.prior[u] * (((__builtin_popcountll(t & u) & 1) == 1) ? -1.0 : 1.0);
++        }
++        result *= acc;
++    }
++    return result;
++}
++
++/// Computes E[(-1)^{<f, (s, l)>}] for a binary detector error model.
++double dem_parity_expectation(
++    const DetectorErrorModel &dem, const std::vector<bool> &det_mask, const std::vector<bool> &obs_mask) {
++    double result = 1;
++    for (const auto &e : dem.instructions) {
++        if (e.type != DemInstructionType::DEM_ERROR) {
++            continue;
++        }
++        size_t hits = 0;
++        for (const auto &t : e.target_data) {
++            if (t.is_relative_detector_id() && det_mask[t.raw_id()]) {
++                hits++;
++            }
++            if (t.is_observable_id() && obs_mask[t.raw_id()]) {
++                hits++;
++            }
++        }
++        if (hits & 1) {
++            result *= 1 - 2 * e.arg_data[0];
++        }
++    }
++    return result;
++}
++
++/// Checks that the non-binary dem is equivalent to Stim's binary dem for all
++/// parity expectations, on random masks. This is the paper's exactness check.
++void expect_nb_equivalent_to_stim_dem(
++    const Circuit &circuit, size_t num_checks = 25, bool approximate_disjoint_errors = false) {
++    NonbinaryDem nb = circuit_to_nonbinary_dem(circuit);
++    DemOptions dem_opts;
++    dem_opts.approximate_disjoint_errors_threshold = approximate_disjoint_errors ? 1 : 0;
++    DetectorErrorModel dem = circuit_to_dem(circuit, dem_opts).flattened();
++    expect_dem_errors_equal(nb.binary_image(), dem);
++    std::mt19937 rng(0);
++    for (size_t k = 0; k < num_checks; k++) {
++        std::vector<bool> det_mask(nb.num_detectors);
++        std::vector<bool> obs_mask(nb.num_observables);
++        for (size_t d = 0; d < det_mask.size(); d++) {
++            det_mask[d] = (rng() & 1) != 0;
++        }
++        for (size_t o = 0; o < obs_mask.size(); o++) {
++            obs_mask[o] = (rng() & 1) != 0;
++        }
++        ASSERT_NEAR(nb_parity_expectation(nb, det_mask, obs_mask), dem_parity_expectation(dem, det_mask, obs_mask), 1e-12);
++    }
++    // Structural invariants.
++    for (const auto &col : nb.columns) {
++        double total = 0;
++        for (double p : col.prior) {
++            ASSERT_GE(p, -1e-12);
++            total += p;
++        }
++        ASSERT_NEAR(total, 1, 1e-9);
++        ASSERT_EQ(col.prior.size(), 1ULL << col.rank);
++    }
++}
++
++}  // namespace
++
++TEST(nb_dem, x_error_columns_merge) {
++    Circuit c(R"CIRCUIT(
++        R 0 1 2 3
++        X_ERROR(0.001) 0 1 2 3
++        M 0 1 2 3
++        DETECTOR rec[-4] rec[-3]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    // Errors on qubits 0 and 1 flip the detector; errors on 2 and 3 flip nothing.
++    // The two parts merge into one mechanism, assigned to the earlier location
++    // (qubit 0) by the rank-first tie-breaking.
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 1);
++    ASSERT_EQ(nb.columns[0].origins.size(), 1);
++    ASSERT_EQ(nb.columns[0].origins[0], "X_ERROR(0.001) 0");
++    ASSERT_EQ(nb.columns[0].detector_edges.size(), 1);
++    ASSERT_NEAR(nb.columns[0].prior[0], 1 - 0.0019980000000000, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[1], 0.0019980000000000, 1e-12);
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, y_error_reduces_to_rank_one) {
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        Y_ERROR(0.01) 0
++        M 0 1
++        DETECTOR rec[-2] rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    // A Y error acts as X*Z on the measured qubit: a single binary mechanism.
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 1);
++    ASSERT_NEAR(nb.columns[0].prior[1], 0.01, 1e-12);
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, depolarize2_with_invisible_directions) {
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        X_ERROR(0.125) 0
++        DEPOLARIZE2(0.25) 0 1
++        M 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    // The Z components of both qubits commute with the measurement, so the
++    // two-qubit channel reduces to a quaternary column over the X components.
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 2);
++    // Exact prior of the reduced channel convolved with the absorbed X_ERROR:
++    // pi''(u) = (1-p) pi'(u) + p pi'(u xor 01) with p = 0.125 and
++    // pi' = (0.8, 1/15, 1/15, 1/15) over the (x0, x1) coordinates.
++    ASSERT_NEAR(nb.columns[0].prior[0], 0.875 * 0.8 + 0.125 / 15.0, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[1], 0.875 / 15.0 + 0.125 * 0.8, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[2], 1.0 / 15, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[3], 1.0 / 15, 1e-12);
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, measurement_flip_recording) {
++    Circuit c(R"CIRCUIT(
++        R 0 1 2
++        M(0.01) 2 0 1
++        DETECTOR rec[-3]
++        DETECTOR rec[-2] rec[-1]
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, mr_and_mx_flips) {
++    Circuit c(R"CIRCUIT(
++        RX 0 1
++        MRX(0.02) 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++        R 2 3
++        MR(0.03) 2 3
++        DETECTOR rec[-2] rec[-1]
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, mxx_flips) {
++    Circuit c(R"CIRCUIT(
++        RX 0 1 2 3
++        MXX(0.01) 0 1 2 3
++        DETECTOR rec[-2] rec[-1]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, pauli_channel_1_factorizes) {
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        PAULI_CHANNEL_1(0.02, 0.03, 0.04) 0 1
++        M 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++        DETECTOR rec[-2] rec[-1]
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, pauli_channel_2_exact) {
++    // A PAULI_CHANNEL_2 that factorizes exactly into independent parts:
++    // q_x1 = q_z1 = q_x2 = q_z2 = 0.05. Note that Stim approximates
++    // PAULI_CHANNEL_2 by independent disjoint mechanisms even when the channel
++    // factorizes, so its binary dem does NOT match the exact law here; the
++    // non-binary dem represents the channel exactly.
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        PAULI_CHANNEL_2(0.04286875, 0.00225625, 0.04286875, 0.04286875, 0.00225625, 0.00011875, 0.00225625, 0.00225625, 0.00011875, 0.00000625, 0.00011875, 0.04286875, 0.00225625, 0.00011875, 0.00225625) 0 1
++        M 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++        DETECTOR rec[-2] rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    // The Z components are invisible to the Z-basis measurements, so the
++    // channel reduces to a quaternary column over the X components.
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 2);
++    // Exact prior: independent X components with probability 0.05 per qubit.
++    ASSERT_NEAR(nb.columns[0].prior[0], 0.95 * 0.95, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[1], 0.05 * 0.95, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[2], 0.05 * 0.95, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[3], 0.05 * 0.05, 1e-12);
++    // Parity expectations match the exact channel law.
++    std::vector<bool> dm{true, false};
++    std::vector<bool> om{};
++    ASSERT_NEAR(nb_parity_expectation(nb, dm, om), 1 - 2 * 0.05, 1e-12);
++}
++
++TEST(nb_dem, non_factorizable_channel_kept_whole) {
++    // The paper's example: pi = (1-2a, a, a, 0) for I, X, Z, Y. This channel is
++    // anti-correlated and has no exact binary factorization, so the column is
++    // kept whole with its exact prior. Stim's binary dem approximates it.
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        H 0
++        CX 0 1
++        PAULI_CHANNEL_1(0.05, 0.0, 0.05) 0
++        MPP X0*X1
++        MPP Z0*Z1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_FALSE(nb.columns[0].factorized);
++    ASSERT_EQ(nb.columns[0].rank, 2);
++    // Exact prior of the channel: pi(I) = 0.9, pi(X) = 0.05, pi(Z) = 0.05, pi(Y) = 0.
++    // Coordinates: bit0 = X component, bit1 = Z component.
++    ASSERT_NEAR(nb.columns[0].prior[0], 0.9, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[1], 0.05, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[2], 0.05, 1e-12);
++    ASSERT_NEAR(nb.columns[0].prior[3], 0.0, 1e-12);
++    ASSERT_TRUE(nb.columns[0].parts.empty());
++    // Parity expectations must match the exact channel, not Stim's approximation.
++    // E[(-1)^s0] for the first detector (flipped by the X component): 1 - 2 * 0.05.
++    std::vector<bool> det_mask{true, false};
++    std::vector<bool> obs_mask{};
++    ASSERT_NEAR(nb_parity_expectation(nb, det_mask, obs_mask), 1 - 2 * 0.05, 1e-12);
++}
++
++TEST(nb_dem, e_else_chain_exact) {
++    // A plain CORRELATED_ERROR is exact in Stim; the chain column must match.
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        E(0.1) X0 X1
++        M 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c);
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 1);  // A single correlated error reduces to one part.
++    ASSERT_NEAR(nb.columns[0].prior[1], 0.1, 1e-12);
++}
++
++TEST(nb_dem, else_chain_is_one_exact_column) {
++    // An E/ELSE chain is one raw column with the exact disjoint prior.
++    Circuit c(R"CIRCUIT(
++        R 0 1 2 3
++        E(0.1) X0 X1
++        ELSE_CORRELATED_ERROR(0.2) X2
++        ELSE_CORRELATED_ERROR(0.3) Y3
++        M 0 1 2 3
++        DETECTOR rec[-4]
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NbDemOptions opts;
++    opts.merge = NbDemMergeMode::NONE;
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c, opts);
++    // Generators: X@0, X@1, X@2, X@3, Z@3. The three alternatives have the
++    // independent symptoms X0X1, X2, Y3 -> rank 3.
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 3);
++    ASSERT_FALSE(nb.columns[0].factorized);
++    // Exact prior: P(000) = 0.9*0.8*0.7, P(X0X1) = 0.1, P(Z2) = 0.9*0.2, P(Y3) = 0.9*0.8*0.3.
++    double total = 0;
++    for (double p : nb.columns[0].prior) {
++        total += p;
++    }
++    ASSERT_NEAR(total, 1.0, 1e-12);
++}
++
++TEST(nb_dem, loops_are_unrolled) {
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        X_ERROR(0.01) 0 1
++        M 0 1
++        DETECTOR rec[-2] rec[-1]
++        REPEAT 5 {
++            X_ERROR(0.02) 0
++            M 0 1
++            DETECTOR rec[-2] rec[-1]
++        }
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c);
++}
++
++TEST(nb_dem, 422_code_example) {
++    // One round of syndrome extraction on the [[4,2,2]] code, with the three
++    // fault locations highlighted in the paper's example: a depolarizing
++    // channel I on a data qubit before the round, a two-qubit depolarizing
++    // channel C after the CNOT from that data qubit to the Z ancilla, and a
++    // measurement flip M on the Z ancilla.
++    Circuit c(R"CIRCUIT(
++        R 0 1 2 3 4 5
++        H 0
++        CX 0 1
++        CX 0 2
++        CX 0 3
++        H 5
++        DEPOLARIZE1(0.03) 1
++        CX 0 4
++        CX 5 1
++        CX 1 4
++        DEPOLARIZE2(0.03) 1 4
++        CX 5 0
++        CX 2 4
++        CX 5 3
++        CX 3 4
++        CX 5 2
++        X_ERROR(0.03) 4
++        M 4
++        MX 5
++        MPP X0*X1*X2*X3
++        M 0 1 2 3
++        DETECTOR rec[-7]
++        DETECTOR rec[-6]
++        DETECTOR rec[-6] rec[-5]
++        DETECTOR rec[-7] rec[-4] rec[-3] rec[-2] rec[-1]
++        OBSERVABLE_INCLUDE(0) rec[-4] rec[-3]
++    )CIRCUIT");
++    expect_nb_equivalent_to_stim_dem(c, 50);
++
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    // The measurement flip M and the X part of the depolarizing channel I are
++    // degenerate with parts of the two-qubit channel C, so the rank-first
++    // regrouping merges them into the 16-ary column of C.
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 4);
++    ASSERT_EQ(nb.columns[0].detector_edges.size(), 4);
++    // The claimed parts reproduce the binary dem's mechanisms.
++    ASSERT_EQ(nb.columns[0].parts.size(), circuit_to_dem(c).flattened().count_errors());
++    // Prior table sums to one and has 16 entries.
++    ASSERT_EQ(nb.columns[0].prior.size(), 16);
++    double total = 0;
++    for (double p : nb.columns[0].prior) {
++        total += p;
++    }
++    ASSERT_NEAR(total, 1.0, 1e-9);
++}
++
++TEST(nb_dem, merge_modes) {
++    Circuit c(R"CIRCUIT(
++        R 0 1 2 3
++        X_ERROR(0.01) 2 3
++        DEPOLARIZE1(0.02) 0 1
++        M 0 1 2 3
++        DETECTOR rec[-4] rec[-3]
++        DETECTOR rec[-2]
++    )CIRCUIT");
++    size_t num[3] = {0, 0, 0};
++    std::map<NbDemMergeMode, size_t> mode_index{
++        {NbDemMergeMode::NONE, 0}, {NbDemMergeMode::COLUMNS, 1}, {NbDemMergeMode::PARTS, 2}};
++    for (auto mode : {NbDemMergeMode::NONE, NbDemMergeMode::COLUMNS, NbDemMergeMode::PARTS}) {
++        NbDemOptions opts;
++        opts.merge = mode;
++        NonbinaryDem nb = circuit_to_nonbinary_dem(c, opts);
++        for (const auto &col : nb.columns) {
++            double total = 0;
++            for (double p : col.prior) {
++                total += p;
++            }
++            ASSERT_NEAR(total, 1.0, 1e-9);
++        }
++        num[mode_index[mode]] = nb.columns.size();
++    }
++    // parts <= columns <= none.
++    ASSERT_LE(num[2], num[1]);
++    ASSERT_LE(num[1], num[0]);
++    ASSERT_EQ(num[2], 2);  // One column for the visible depolarizing channel, one for qubit 2's flip.
++}
++
++TEST(nb_dem, output_formats_parse) {
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        DEPOLARIZE1(0.01) 0 1
++        M 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    std::string text = nb.str();
++    ASSERT_NE(text.find("nb_detector_error_model"), std::string::npos);
++    ASSERT_NE(text.find("column[0]"), std::string::npos);
++    ASSERT_NE(text.find("prior"), std::string::npos);
++    std::string json = nb.to_json();
++    ASSERT_EQ(json.front(), '{');
++    ASSERT_EQ(json.back(), '}');
++    ASSERT_NE(json.find("\"num_detectors\":2"), std::string::npos);
++    ASSERT_NE(json.find("\"rank\":1"), std::string::npos);
++}
++
++TEST(nb_dem, pauli_labels) {
++    // Two-qubit depolarizing channel on a CNOT: edge labels must render as
++    // two-qubit Paulis (I, X, Y, Z on each of the two qubits).
++    Circuit c(R"CIRCUIT(
++        R 0 1 2 3
++        CX 0 1 2 3
++        DEPOLARIZE2(0.01) 0 1 2 3
++        M 0 1 2 3
++        DETECTOR rec[-4] rec[-3]
++        DETECTOR rec[-2] rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    for (const auto &col : nb.columns) {
++        if (col.rank == 4) {
++            ASSERT_EQ(col.generator_labels.size(), 4);
++            std::set<std::string> labels;
++            for (const auto &[d, label] : col.detector_edges) {
++                std::string s = nb.str();
++                ASSERT_NE(s.find("det_edge D" + std::to_string(d)), std::string::npos);
++            }
++            // Check that Pauli labels appear in the text output.
++            for (const auto &g : col.generator_labels) {
++                ASSERT_EQ(g[1], '@');
++            }
++        }
++    }
++}
++
++TEST(nb_dem, assign_uses_origins_only) {
++    // The paper's Assign step lets a part go only to its origin locations, not
++    // to any column whose span contains it. The channel below is the XOR of
++    // independent parts X'~0.2 and Y'~0.1 (so its disjoint probabilities are
++    // px = 0.2*0.9, py = 0.8*0.1, pz = 0.2*0.1): its factorization has parts
++    // only on the X and Y symptoms, so the "Z direction" lies in the column's
++    // span without being one of its parts. A Z_ERROR with that symptom must
++    // keep its own column instead of being absorbed by the higher-rank
++    // channel.
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        H 0
++        CX 0 1
++        PAULI_CHANNEL_1(0.18, 0.08, 0.02) 0
++        Z_ERROR(0.05) 0
++        MPP X0*X1
++        MPP Z0*Z1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    ASSERT_EQ(nb.columns.size(), 2);
++    size_t rank2 = 0, rank1 = 0;
++    for (const auto &col : nb.columns) {
++        if (col.rank == 2) {
++            rank2++;
++            ASSERT_TRUE(col.factorized);
++            ASSERT_EQ(col.parts.size(), 2);
++            // The parts are the independent X' and Y' components.
++            double p1 = col.parts[0].probability;
++            double p2 = col.parts[1].probability;
++            ASSERT_NEAR(std::min(p1, p2), 0.1, 1e-12);
++            ASSERT_NEAR(std::max(p1, p2), 0.2, 1e-12);
++        } else if (col.rank == 1) {
++            rank1++;
++            ASSERT_EQ(col.parts.size(), 1);
++            ASSERT_NEAR(col.parts[0].probability, 0.05, 1e-12);
++        }
++    }
++    ASSERT_EQ(rank2, 1);
++    ASSERT_EQ(rank1, 1);
++}
++
++TEST(nb_dem, label_convention) {
++    // Kuo-Lai convention: the label is the Pauli the error anticommutes
++    // with. A detector flipped by X errors gets label Z, one flipped by Z
++    // errors gets label X (paper: "the labels Z, X and Y mean that the
++    // detector is flipped by X and Y, by Z and Y, or by X and Z").
++    Circuit c(R"CIRCUIT(
++        R 0 1
++        H 0
++        CX 0 1
++        DEPOLARIZE1(0.01) 0
++        MPP X0*X1
++        MPP Z0*Z1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb = circuit_to_nonbinary_dem(c);
++    ASSERT_EQ(nb.columns.size(), 1);
++    ASSERT_EQ(nb.columns[0].rank, 2);
++    std::string text = nb.str();
++    // D0 measures X0*X1 (flipped by Z errors on qubit 0): label X.
++    ASSERT_NE(text.find("det_edge D0 X\n"), std::string::npos);
++    // D1 measures Z0*Z1 (flipped by X errors on qubit 0): label Z.
++    ASSERT_NE(text.find("det_edge D1 Z\n"), std::string::npos);
++
++    // A two-qubit channel reduced to generators X@0 and X@1 has no Pauli
++    // basis and must render labels as bit vectors.
++    Circuit c2(R"CIRCUIT(
++        R 0 1
++        X_ERROR(0.125) 0
++        DEPOLARIZE2(0.25) 0 1
++        M 0 1
++        DETECTOR rec[-2]
++        DETECTOR rec[-1]
++    )CIRCUIT");
++    NonbinaryDem nb2 = circuit_to_nonbinary_dem(c2);
++    ASSERT_EQ(nb2.columns.size(), 1);
++    ASSERT_EQ(nb2.columns[0].rank, 2);
++    std::string text2 = nb2.str();
++    ASSERT_NE(text2.find("det_edge D0 10\n"), std::string::npos);
++    ASSERT_NE(text2.find("det_edge D1 01\n"), std::string::npos);
++}
